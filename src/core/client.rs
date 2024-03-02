@@ -82,6 +82,7 @@ where
             disconnect_requested: Arc::new(AtomicBool::new(false)),
         }
     }
+
     fn send_request(&mut self, request: &str) -> Result<(), IBKRApiLibError> {
         let bytes = make_message(request)?;
         self.send_bytes(bytes.as_slice())?;
