@@ -27,7 +27,7 @@ pub fn main() -> Result<(), IBKRApiLibError> {
         }
     };
 
-    let wrapper = Arc::new(Mutex::new(TestWrapper::<TcpStreamer>::new()));
+    let wrapper = Arc::new(Mutex::new(TestWrapper::new()));
     let app = Arc::new(Mutex::new(EClient::new(wrapper.clone())));
 
     info!("getting connection...");

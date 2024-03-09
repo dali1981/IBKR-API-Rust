@@ -46,13 +46,14 @@ const CLIENT_IS_NONE: &str = "Client must be assigned!";
 //==================================================================================================
 /// Example implementation of the Wrapper callback trait.  Just logs callback methods
 //#[derive(Debug)]
-pub struct TestWrapper<T: Streamer + 'static> {
-    pub client: Option<Arc<Mutex<EClient<TestWrapper<T>>>>>,
+#[derive(Debug)]
+pub struct TestWrapper { //<T: Streamer + 'static> {
+    pub client: Option<Arc<Mutex<EClient>>>,
     pub next_order_id: i32,
     account: String,
 }
 
-impl<T: Streamer> TestWrapper<T> {
+impl TestWrapper {
     pub fn new() -> Self {
         TestWrapper {
             client: None,
@@ -3010,9 +3011,7 @@ impl<T: Streamer> TestWrapper<T> {
     }
 }
 
-impl<T> Wrapper for TestWrapper<T>
-where
-    T: Streamer + 'static,
+impl Wrapper for TestWrapper
 {
     fn error(&mut self, req_id: i32, error_code: i32, error_string: &str) {
         error!(
@@ -3857,5 +3856,9 @@ where
     //----------------------------------------------------------------------------------------------
     fn completed_orders_end(&mut self) {
         info!("completed_orders_end -- (no parameters for this message)");
+    }
+
+    fn wsh_meta_data(&mut self, req_id: i32, data_json: &str) {
+        info!("wsh_meta_data req_id: {} data: {}", req_id, data_json);
     }
 }

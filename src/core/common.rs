@@ -1,6 +1,7 @@
 //! Common types
 use std::fmt::Display;
 use std::fmt::{self, Error, Formatter};
+use bigdecimal::BigDecimal;
 
 use num_derive::FromPrimitive;
 
@@ -269,9 +270,9 @@ pub struct BarData {
     pub high: f64,
     pub low: f64,
     pub close: f64,
-    pub volume: i64,
+    pub volume: BigDecimal,
     pub bar_count: i32,
-    pub average: f64,
+    pub wap: BigDecimal,
 }
 
 impl BarData {
@@ -281,9 +282,9 @@ impl BarData {
         high: f64,
         low: f64,
         close: f64,
-        volume: i64,
+        volume: BigDecimal,
         bar_count: i32,
-        average: f64,
+        average: BigDecimal,
     ) -> Self {
         BarData {
             date,
@@ -293,7 +294,7 @@ impl BarData {
             close,
             volume,
             bar_count,
-            average,
+            wap: average,
         }
     }
 }
@@ -301,7 +302,7 @@ impl BarData {
 impl fmt::Display for BarData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "date: {}, open: {}, high: {}, low: {}, close: {}, volume: {}, average: {}, barcount: {}", self.date, self.open, self.high,
-               self.low, self.close, self.volume, self.average, self.bar_count)
+               self.low, self.close, self.volume, self.wap, self.bar_count)
     }
 }
 
@@ -324,8 +325,8 @@ pub struct RealTimeBar {
     pub high: f64,
     pub low: f64,
     pub close: f64,
-    pub volume: i64,
-    pub wap: f64,
+    pub volume: BigDecimal,
+    pub wap: BigDecimal,
     pub count: i32,
 }
 
@@ -336,8 +337,8 @@ impl RealTimeBar {
         high: f64,
         low: f64,
         close: f64,
-        volume: i64,
-        wap: f64,
+        volume: BigDecimal,
+        wap: BigDecimal,
         count: i32,
     ) -> Self {
         RealTimeBar {

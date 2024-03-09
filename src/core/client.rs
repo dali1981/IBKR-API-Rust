@@ -45,12 +45,10 @@ pub enum ConnStatus {
 
 //==================================================================================================
 /// Struct for sending requests
-//#[derive(Debug)]
-pub struct EClient<T>
-where
-    T: Wrapper,
+#[derive(Debug)]
+pub struct EClient
 {
-    wrapper: Arc<Mutex<T>>,
+    wrapper: Arc<Mutex<dyn Wrapper>>,
     pub(crate) stream: Option<Box<dyn Streamer>>,
     host: String,
     port: u32,
@@ -63,11 +61,9 @@ where
     disconnect_requested: Arc<AtomicBool>,
 }
 
-impl<T> EClient<T>
-where
-    T: Wrapper + Send + Sync + 'static,
+impl EClient
 {
-    pub fn new(wrapper: Arc<Mutex<T>>) -> Self {
+    pub fn new(wrapper: Arc<Mutex<dyn Wrapper>>) -> Self {
         EClient {
             wrapper: wrapper,
             stream: None,
@@ -120,6 +116,7 @@ where
         self.disconnect_requested.store(false, Ordering::Release);
         *self.conn_state.lock().expect(POISONED_MUTEX) = ConnStatus::CONNECTING;
         let tcp_stream = TcpStream::connect(format!("{}:{}", self.host, port))?;
+        // tcp_stream.set_nonblocking(true)?;
         let streamer = TcpStreamer::new(tcp_stream);
         self.set_streamer(Option::from(Box::new(streamer.clone()) as Box<dyn Streamer>));
         let (tx, rx) = channel::<String>();
@@ -133,6 +130,7 @@ where
 
         let v_100_prefix = "API\0";
         let v_100_version = format!("v{}..{}", MIN_CLIENT_VER, MAX_CLIENT_VER);
+        // let v_100_version = format!("v{}..{}", MIN_CLIENT_VER, 178);  //todo
 
         let msg = make_message(v_100_version.as_str())?;
 
@@ -4493,6 +4491,35 @@ where
         self.send_request(msg.as_str())?;
         Ok(())
     }
+
+    pub fn req_wsh_meta_data(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID)?;
+
+        if self.server_version < MIN_SERVER_VER_WSHE_CALENDAR {
+            let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
+                NO_VALID_ID,
+                TwsError::UpdateTws.code().to_string(),
+                format!(
+                    "{}{}",
+                    TwsError::UpdateTws.message(),
+                    "  It does not support WSHE Calendar API."
+                ),
+            ));
+
+            return Err(err);
+        }
+
+        let message_id: i32 = OutgoingMessageIds::ReqWshMetaData as i32;
+
+        let mut msg = "".to_string();
+        msg.push_str(&make_field(&message_id)?);
+
+        msg.push_str(&make_field(&req_id)?);
+
+        self.send_request(msg.as_str())?;
+        Ok(())
+    }
+
 
     //------------------------------------------------------------------------------------------------
     /// check if client is connected to TWS

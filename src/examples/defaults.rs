@@ -21,6 +21,7 @@ use crate::core::wrapper::Wrapper;
 
 //==================================================================================================
 /// Example implementation of the Wrapper callback trait.  Just logs callback methods
+#[derive(Debug)]
 pub struct DefaultWrapper {}
 
 impl DefaultWrapper {
@@ -866,5 +867,9 @@ impl Wrapper for DefaultWrapper {
     //----------------------------------------------------------------------------------------------
     fn completed_orders_end(&mut self) {
         info!("completed_orders_end -- (no parameters for this message)");
+    }
+
+    fn wsh_meta_data(&mut self, req_id: i32, data_json: &str) {
+        info!("wsh_meta_data req_id: {} data: {}", req_id, data_json);
     }
 }

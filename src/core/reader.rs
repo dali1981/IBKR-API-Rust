@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use log::*;
+use tracing::*;
 
 use super::streamer::Streamer;
 use crate::core::errors::IBKRApiLibError;
@@ -76,7 +76,10 @@ impl Reader {
     fn process_reader_msgs(&mut self) -> Result<(), IBKRApiLibError> {
         // grab a packet of messages from the socket
         let mut message_packet = self.recv_packet()?;
-        //debug!(" recvd size {}", message_packet.len());
+        // debug!(" recvd size {}", message_packet.len());
+        // debug!(" recvd  {:?}", message_packet);
+        debug!(?message_packet);
+
 
         // Read messages from the packet until there are no more.
         // When this loop ends, break into the outer loop and grab another packet.
@@ -86,6 +89,8 @@ impl Reader {
         while message_packet.len() > 0 {
             // Read a message from the packet then add it to the message queue below.
             let (_size, msg, remaining_messages) = read_msg(message_packet.as_slice())?;
+
+            debug!(_size, msg, ?remaining_messages);
 
             // clear the Vec that holds the bytes from the packet
             // and reload with the bytes that haven't been read.

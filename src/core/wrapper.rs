@@ -1,5 +1,6 @@
 //! Clients implement the Wrapper trait in this module to receive data and notifications from Trader WorkStation or IB Gateway
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::marker::{Send, Sync};
 
 use bigdecimal::BigDecimal;
@@ -15,7 +16,7 @@ use crate::core::execution::Execution;
 use crate::core::order::{Order, OrderState, SoftDollarTier};
 
 /// A trait that clients will implement that declares callback functions that get called when the application receives messages from the Trader WorkStation or IB Gateway
-pub trait Wrapper: Send + Sync {
+pub trait Wrapper: Send + Sync + Debug {
     //----------------------------------------------------------------------------------------------
     /// This event is called when there is an error with the
     /// communication or when TWS wants to send a message to the core.
@@ -714,4 +715,6 @@ pub trait Wrapper: Send + Sync {
     //----------------------------------------------------------------------------------------------
     /// This is called at the end of a given request for completed orders.
     fn completed_orders_end(&mut self);
+
+    fn wsh_meta_data(&mut self, req_id: i32, data_json: &str);
 }

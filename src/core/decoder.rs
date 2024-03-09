@@ -9,7 +9,8 @@ use std::string::ToString;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
-use bigdecimal::BigDecimal;
+use bigdecimal::{self, BigDecimal, Zero};
+
 use float_cmp::*;
 use log::*;
 use num_traits::float::FloatCore;
@@ -99,19 +100,25 @@ pub fn decode_bool(iter: &mut Iter<String>) -> Result<bool, IBKRApiLibError> {
 }
 
 //==================================================================================================
-pub struct Decoder<T: Wrapper> {
+
+pub fn decode_dec(iter: &mut Iter<String>) -> Result<BigDecimal, IBKRApiLibError> {
+    let next = iter.next();
+    //info!("{:?}", next);
+    let val: BigDecimal = next.unwrap().parse().unwrap_or(BigDecimal::zero());
+    Ok(val)
+}
+
+pub struct Decoder {
     msg_queue: Receiver<String>,
-    pub wrapper: Arc<Mutex<T>>,
+    pub wrapper: Arc<Mutex<dyn Wrapper>>,
     pub server_version: i32,
     conn_state: Arc<Mutex<ConnStatus>>,
 }
 
-impl<T> Decoder<T>
-where
-    T: Wrapper + Sync,
+impl Decoder
 {
     pub fn new(
-        the_wrapper: Arc<Mutex<T>>,
+        the_wrapper: Arc<Mutex<dyn Wrapper>>,
         msg_queue: Receiver<String>,
         server_version: i32,
         conn_state: Arc<Mutex<ConnStatus>>,
@@ -265,6 +272,10 @@ where
             }
             Some(IncomingMessageIds::RerouteMktDepthReq) => {
                 self.process_reroute_mkt_depth_req(fields)?
+            }
+
+            Some(IncomingMessageIds::WshMetaData) => {
+                self.process_wsh_meta_data(fields)?
             }
 
             _ => panic!("Received unkown message id!!  Exiting..."),
@@ -1066,12 +1077,13 @@ where
             bar.high = decode_f64(&mut fields_itr)?;
             bar.low = decode_f64(&mut fields_itr)?;
             bar.close = decode_f64(&mut fields_itr)?;
-            bar.volume = if self.server_version < MIN_SERVER_VER_SYNT_REALTIME_BARS {
-                decode_i32(&mut fields_itr)? as i64
-            } else {
-                decode_i64(&mut fields_itr)?
-            };
-            bar.average = decode_f64(&mut fields_itr)?;
+            // bar.volume = if self.server_version < MIN_SERVER_VER_SYNT_REALTIME_BARS {
+            //     decode_i32(&mut fields_itr)? as BigDecimal
+            // } else {
+            //     decode_i64(&mut fields_itr)? as BigDecimal
+            // };
+            bar.volume = decode_dec(&mut fields_itr)?;
+            bar.wap = decode_dec(&mut fields_itr)?;
 
             if self.server_version < MIN_SERVER_VER_SYNT_REALTIME_BARS {
                 decode_string(&mut fields_itr)?; //has_gaps
@@ -1109,8 +1121,8 @@ where
         bar.close = decode_f64(&mut fields_itr)?;
         bar.high = decode_f64(&mut fields_itr)?;
         bar.low = decode_f64(&mut fields_itr)?;
-        bar.average = decode_f64(&mut fields_itr)?;
-        bar.volume = decode_i64(&mut fields_itr)?;
+        bar.wap = decode_dec(&mut fields_itr)?;
+        bar.volume = decode_dec(&mut fields_itr)?;
         self.wrapper
             .lock()
             .expect(WRAPPER_POISONED_MUTEX)
@@ -1884,8 +1896,10 @@ where
         bar.high = decode_f64(&mut fields_itr)?;
         bar.low = decode_f64(&mut fields_itr)?;
         bar.close = decode_f64(&mut fields_itr)?;
-        bar.volume = decode_i64(&mut fields_itr)?;
-        bar.wap = decode_f64(&mut fields_itr)?;
+        // bar.volume = decode_i64(&mut fields_itr)?;
+        // bar.wap = decode_f64(&mut fields_itr)?;
+        bar.volume = decode_dec(&mut fields_itr)?;
+        bar.wap = decode_dec(&mut fields_itr)?;
         bar.count = decode_i32(&mut fields_itr)?;
 
         self.wrapper
@@ -2543,6 +2557,23 @@ where
             .lock()
             .expect(WRAPPER_POISONED_MUTEX)
             .verify_completed(is_successful, error_text.as_ref());
+        Ok(())
+    }
+
+    fn process_wsh_meta_data(&mut self, fields: &[String]) -> Result<(), IBKRApiLibError> {
+        let mut fields_itr = fields.iter();
+        //throw away message_id
+        fields_itr.next();
+        //throw away version
+        fields_itr.next();
+
+        let req_id = decode_i32(&mut fields_itr)?;
+        let data_json = decode_string(&mut fields_itr)?;
+
+        self.wrapper
+            .lock()
+            .expect(WRAPPER_POISONED_MUTEX)
+            .wsh_meta_data(req_id, &data_json);
         Ok(())
     }
 

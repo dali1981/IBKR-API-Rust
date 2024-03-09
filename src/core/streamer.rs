@@ -4,9 +4,10 @@ use std::{
     io::{self, Read, Write},
     net::Shutdown,
 };
+use std::fmt::Debug;
 
 //----------------------------------------------------------------------------------------------
-pub trait Streamer: Read + Write + Send + Sync {
+pub trait Streamer: Read + Write + Send + Sync + Debug {
     fn shutdown(&mut self, how: Shutdown) -> io::Result<()>;
     fn connect(&mut self, addr: &SocketAddr);
 }
@@ -54,6 +55,7 @@ impl Write for TcpStreamer {
 }
 
 //----------------------------------------------------------------------------------------------
+#[derive(Debug)]
 pub struct TestStreamer {
     stream: ByteBuffer,
 }
@@ -65,6 +67,7 @@ impl TestStreamer {
         }
     }
 }
+
 
 impl Streamer for TestStreamer {
     fn shutdown(&mut self, _how: Shutdown) -> io::Result<()> {

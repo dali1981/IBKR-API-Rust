@@ -111,6 +111,11 @@ pub enum IncomingMessageIds {
     OrderBound = 100,
     CompletedOrder = 101,
     CompletedOrdersEnd = 102,
+    ReplaceFaEnd = 103,  // todo this is an new field : see where it is used
+    WshMetaData = 104,
+    WshEventData = 105,
+    HistoricalSchedule = 106,
+    UserInfo = 107,
 }
 
 //==================================================================================================
@@ -193,6 +198,11 @@ pub enum OutgoingMessageIds {
     ReqTickByTickData = 97,
     CancelTickByTickData = 98,
     ReqCompletedOrders = 99,
+    ReqWshMetaData = 100,
+    CancelWshMetaData = 101,
+    ReqWshEventData = 102,
+    CancelWshEventData = 103,
+    ReqUserInfo = 104,
 }
 
 //==================================================================================================
