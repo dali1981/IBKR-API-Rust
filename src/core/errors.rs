@@ -2,6 +2,7 @@
 use std::num::{ParseFloatError, ParseIntError};
 use std::sync::mpsc::{RecvError, RecvTimeoutError};
 use std::{error, fmt, io};
+use tracing::error;
 
 const ALREADY_CONNECTED: (i32, &str) = (501, "Already connected.");
 const CONNECT_FAIL: (i32, &str) = (502, "Couldn't connect to TWS. Confirm that \"Enable ActiveX and Socket EClients\"
@@ -83,6 +84,7 @@ pub enum IBKRApiLibError {
     RecvError(RecvError),
     RecvTimeoutError(RecvTimeoutError),
     ApiError(TwsApiReportableError),
+    General(String)
 }
 
 impl fmt::Display for IBKRApiLibError {
@@ -96,6 +98,7 @@ impl fmt::Display for IBKRApiLibError {
             IBKRApiLibError::RecvError(ref err) => write!(f, "Recieve error: {}", err),
             IBKRApiLibError::RecvTimeoutError(ref err) => write!(f, "Reader Send error {}", err),
             IBKRApiLibError::ApiError(ref err) => write!(f, "TWS Error: {}", err),
+            IBKRApiLibError::General(err) => write!(f, "TWS Error: {}", err),
         }
     }
 }
@@ -111,6 +114,7 @@ impl fmt::Debug for IBKRApiLibError {
             IBKRApiLibError::RecvError(ref err) => write!(f, "Recieve error: {}", err),
             IBKRApiLibError::RecvTimeoutError(ref err) => write!(f, "Reader Send error {}", err),
             IBKRApiLibError::ApiError(ref err) => write!(f, "TWS Error: {}", err),
+            IBKRApiLibError::General(err) => write!(f, "TWS Error: {}", err),
         }
     }
 }
@@ -128,6 +132,7 @@ impl error::Error for IBKRApiLibError {
             IBKRApiLibError::RecvError(ref err) => Some(err),
             IBKRApiLibError::RecvTimeoutError(ref err) => Some(err),
             IBKRApiLibError::ApiError(ref err) => Some(err),
+            IBKRApiLibError::General(ref err) => None,
         }
     }
 }

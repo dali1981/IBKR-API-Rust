@@ -1,31 +1,34 @@
 //! EClient and supporting structs.  Responsible for connecting to Trader Workstation or IB Gatway and sending requests
 use std::io::Write;
 use std::marker::Sync;
-use std::net::Shutdown;
-use std::net::TcpStream;
+use tokio::net::{ TcpStream, ToSocketAddrs};
+use tokio::io::{self, AsyncWriteExt};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::channel;
-use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::channel;
+use std::sync::Arc;
+use tokio::sync::{Mutex, oneshot};
+use tokio::task;
 use std::{fmt::Debug, thread};
 
 use from_ascii::FromAscii;
-use log::*;
+use tracing::*;
 
 use num_derive::FromPrimitive;
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::unix::SocketAddr;
 
-use super::streamer::{Streamer, TcpStreamer};
 use crate::core::common::*;
 use crate::core::contract::Contract;
 use crate::core::decoder::Decoder;
 use crate::core::errors::{IBKRApiLibError, TwsApiReportableError, TwsError};
 use crate::core::execution::ExecutionFilter;
-use crate::core::messages::make_field;
+use crate::core::messages::{EClientMsgSink, make_field};
 use crate::core::messages::{make_field_handle_empty, read_msg};
 use crate::core::messages::{make_message, read_fields, OutgoingMessageIds};
 use crate::core::order::Order;
 use crate::core::order_condition::Condition;
-use crate::core::reader::Reader;
+use crate::core::reader;
 use crate::core::scanner::ScannerSubscription;
 use crate::core::server_versions::*;
 use crate::core::wrapper::Wrapper;
@@ -48,14 +51,15 @@ pub enum ConnStatus {
 #[derive(Debug)]
 pub struct EClient
 {
-    wrapper: Arc<Mutex<dyn Wrapper>>,
-    pub(crate) stream: Option<Box<dyn Streamer>>,
+    wrapper: Arc<dyn Wrapper>,
+    // pub(crate) stream: Option<OwneWriteHalf>,
+    stream: Option<OwnedWriteHalf>,
     host: String,
     port: u32,
     extra_auth: bool,
     client_id: i32,
-    pub(crate) server_version: i32,
-    conn_time: String,
+    // pub(crate) server_version: i32,
+    msg_sink: Arc<Mutex<EClientMsgSink>>,
     pub conn_state: Arc<Mutex<ConnStatus>>,
     opt_capab: String,
     disconnect_requested: Arc<AtomicBool>,
@@ -63,45 +67,50 @@ pub struct EClient
 
 impl EClient
 {
-    pub fn new(wrapper: Arc<Mutex<dyn Wrapper>>) -> Self {
+    pub fn new(wrapper: Arc<dyn Wrapper>) -> Self {
         EClient {
-            wrapper: wrapper,
+            wrapper,
             stream: None,
             host: "".to_string(),
             port: 0,
             extra_auth: false,
             client_id: 0,
-            server_version: 0,
-            conn_time: "".to_string(),
+            msg_sink: Arc::new(Mutex::new(EClientMsgSink::new())),
             conn_state: Arc::new(Mutex::new(ConnStatus::DISCONNECTED)),
             opt_capab: "".to_string(),
             disconnect_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn send_request(&mut self, request: &str) -> Result<(), IBKRApiLibError> {
+    async fn send_request(&mut self, request: &str) -> Result<(), IBKRApiLibError> {
+        debug!("{}", request.clone());
         let bytes = make_message(request)?;
-        self.send_bytes(bytes.as_slice())?;
+        self.send_bytes(bytes.as_slice()).await?;
         Ok(())
     }
 
-    fn send_bytes(&mut self, bytes: &[u8]) -> Result<usize, IBKRApiLibError> {
-        let return_val = self.stream.as_mut().unwrap().write(bytes)?;
-        Ok(return_val)
+    async fn send_bytes(&mut self, bytes: &[u8]) -> Result<usize, IBKRApiLibError> {
+        if let Some(stream) = self.stream.as_mut() {
+            let return_val = stream.write(bytes).await?;
+            Ok(return_val)
+        } else {
+            // Handle the case where self.stream is None
+            Err(IBKRApiLibError::General("cant write to stream".to_string()) )// You'll need to define this error appropriately
+        }
     }
 
-    pub(crate) fn set_streamer(&mut self, streamer: Option<Box<dyn Streamer>>) {
-        self.stream = streamer;
-    }
+    // pub(crate) async fn set_streamer(&mut self, streamer: TcpStream) {
+    //     self.stream = Some(streamer);
+    // }
     //----------------------------------------------------------------------------------------------
     /// Establishes a connection to TWS or IB Gateway
-    pub fn connect(
+    pub async fn connect(
         &mut self,
         host: &str,
         port: u32,
         client_id: i32,
     ) -> Result<(), IBKRApiLibError> {
-        if self.is_connected() {
+        if self.is_connected().await {
             info!("Already connected...");
             return Err(IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 -1,
@@ -112,110 +121,147 @@ impl EClient
         self.host = host.to_string();
         self.port = port;
         self.client_id = client_id;
-        info!("Connecting");
-        self.disconnect_requested.store(false, Ordering::Release);
-        *self.conn_state.lock().expect(POISONED_MUTEX) = ConnStatus::CONNECTING;
-        let tcp_stream = TcpStream::connect(format!("{}:{}", self.host, port))?;
-        // tcp_stream.set_nonblocking(true)?;
-        let streamer = TcpStreamer::new(tcp_stream);
-        self.set_streamer(Option::from(Box::new(streamer.clone()) as Box<dyn Streamer>));
-        let (tx, rx) = channel::<String>();
-        let mut reader = Reader::new(
-            Box::new(streamer.clone()),
-            tx.clone(),
-            self.disconnect_requested.clone(),
-        );
 
-        let mut fields: Vec<String> = Vec::new();
+        info!("Connecting");
+
+        self.disconnect_requested.store(false, Ordering::Release);
+
+        {
+            let mut conn_state = self.conn_state.lock().await;
+            *conn_state = ConnStatus::CONNECTING;
+        }
+
+        let address = format!("{}:{}", host, port);
+        match TcpStream::connect(address).await {
+            Ok(stream) => {
+                let (tcp_reader, tcp_writer) = stream.into_split();
+                self.stream = Some(tcp_writer);
+                let (tx, rx) = channel::<String>(100);
+                let disconnect_requests = Arc::clone(&self.disconnect_requested);
+
+                task::spawn(async move {
+                    reader::read_message_loop(tcp_reader, tx, disconnect_requests).await
+                });
+
+
+                let mut decoder = Decoder::new(
+                    self.wrapper.clone(),
+                    rx,
+                    0_i32,
+                    self.conn_state.clone(),
+                    Arc::clone(&self.msg_sink)
+                );
+
+                task::spawn(async move { decoder.run().await });
+
+                let (tx1, rx1) = oneshot::channel();
+
+                {
+                    let mut sink_msg = self.msg_sink.lock().await;
+                    sink_msg.set_sender(tx1).await;
+                }
+
+                match self.send_connect_request().await {
+                    Ok(u) => info!(u),
+                    Err(e) => error!("{}", e.to_string()),
+                };
+
+                match rx1.await {
+                    Ok((version, time)) => info!("API version {} started @ {}", version, time),
+                    Err(e) => error!("{}", e.to_string())
+                }
+
+                {
+                    let mut conn_state = self.conn_state.lock().await;
+                    *conn_state = ConnStatus::CONNECTED;
+                }
+
+                info!("Connected");
+                self.start_api().await?;
+                Ok(())
+            }
+            Err(e) => {
+                error!("{}", e.to_string());
+                Err(IBKRApiLibError::from(e))
+            }
+        }
+    }
+
+    async fn send_connect_request(&mut self) -> Result<usize, IBKRApiLibError> {
+
+
 
         let v_100_prefix = "API\0";
-        let v_100_version = format!("v{}..{}", MIN_CLIENT_VER, MAX_CLIENT_VER);
-        // let v_100_version = format!("v{}..{}", MIN_CLIENT_VER, 178);  //todo
+        // let v_100_version = format!("v{}..{}", MIN_CLIENT_VER, MAX_CLIENT_VER);
+        let v_100_version = format!("v{}..{}", MIN_CLIENT_VER, 178);  //todo
 
         let msg = make_message(v_100_version.as_str())?;
+
+        info!(?msg, "send_connect_request");
 
         let mut bytearray: Vec<u8> = Vec::new();
         bytearray.extend_from_slice(v_100_prefix.as_bytes());
         bytearray.extend_from_slice(msg.as_slice());
+        //
+        self.send_bytes(bytearray.as_slice()).await
 
-        self.send_bytes(bytearray.as_slice())?;
+        // let mut fields: Vec<String> = Vec::new();
+        // // An Interactive Broker's developer's note: "sometimes I get news before the server version, thus the loop"
+        // while fields.len() != 2 {
+        //     if fields.len() > 0 {
+        //         decoder.interpret(fields.as_slice())?;
+        //     }
+        //
+        //     let buf = reader.recv_msg()?;
+        //
+        //     if buf.len() > 0 {
+        //         let (_size, msg, _remaining_messages) = read_msg(buf.as_slice())?;
+        //
+        //         fields.clear();
+        //         fields.extend_from_slice(read_fields(msg.as_ref()).as_slice());
+        //     } else {
+        //         fields.clear();
+        //     }
+        // }
+        //
+        // self.server_version = i32::from_ascii(fields.get(0).unwrap().as_bytes()).unwrap();
+        //
+        // info!("Server version: {}", self.server_version);
+        //
+        // self.conn_time = fields.get(1).unwrap().to_string();
+        // decoder.server_version = self.server_version;
 
-        let mut decoder = Decoder::new(
-            self.wrapper.clone(),
-            rx,
-            self.server_version,
-            self.conn_state.clone(),
-        );
 
-        //An Interactive Broker's developer's note: "sometimes I get news before the server version, thus the loop"
-        while fields.len() != 2 {
-            if fields.len() > 0 {
-                decoder.interpret(fields.as_slice())?;
-            }
-
-            let buf = reader.recv_packet()?;
-
-            if buf.len() > 0 {
-                let (_size, msg, _remaining_messages) = read_msg(buf.as_slice())?;
-
-                fields.clear();
-                fields.extend_from_slice(read_fields(msg.as_ref()).as_slice());
-            } else {
-                fields.clear();
-            }
-        }
-
-        self.server_version = i32::from_ascii(fields.get(0).unwrap().as_bytes()).unwrap();
-
-        info!("Server version: {}", self.server_version);
-
-        self.conn_time = fields.get(1).unwrap().to_string();
-        decoder.server_version = self.server_version;
-
-        thread::spawn(move || {
-            reader.run();
-        });
-
-        thread::spawn(move || {
-            if decoder.run().is_err() {
-                panic!("decoder.run() failed!!");
-            }
-        });
-        *self.conn_state.lock().expect(POISONED_MUTEX) = ConnStatus::CONNECTED;
-        info!("Connected");
-        self.start_api()?;
-        Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
     /// Checks connection status
-    pub fn is_connected(&self) -> bool {
-        let connected = match *self.conn_state.lock().unwrap().deref() {
-            ConnStatus::DISCONNECTED => false,
-            ConnStatus::CONNECTED => true,
-            ConnStatus::CONNECTING => false,
-            ConnStatus::REDIRECT => false,
-        };
+    pub async fn is_connected(&self) -> bool {
+        let status: ConnStatus;
+        {
+            let conn_state = self.conn_state.lock().await;
+            status = *conn_state;
+        }
 
-        //debug!("finished checking connected...");
-        connected
+        matches!(status, ConnStatus::CONNECTED)
     }
 
     //----------------------------------------------------------------------------------------------
     /// Get the server version (important for checking feature flags for different versions)
-    pub fn server_version(&self) -> i32 {
-        self.server_version
+    pub async fn server_version(&self) -> i32 {
+        let msg_sink = self.msg_sink.lock().await;
+        msg_sink.version
     }
 
     //----------------------------------------------------------------------------------------------
     /// Sets server logging level
-    pub fn set_server_log_level(&mut self, log_evel: i32) -> Result<(), IBKRApiLibError> {
+    pub async fn set_server_log_level( & mut self , log_evel: i32) -> Result<(), IBKRApiLibError> {
         //The pub default detail level is ERROR. For more details, see API
-        //        Logging.
-        //TODO Make log_level an enum
+//        Logging.
+//TODO Make log_level an enum
         debug!("set_server_log_level -- log_evel: {}", log_evel);
 
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
         let _log_level = log_evel;
@@ -228,21 +274,22 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&_log_level)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
     /// Gets the connection time
-    pub fn tws_connection_time(&mut self) -> String {
+    pub async fn tws_connection_time(&mut self) -> String {
         //"""Returns the time the API client made a connection to TWS."""
 
-        self.conn_time.clone()
+        let msg_sink = self.msg_sink.lock().await;
+        msg_sink.time.to_string()
     }
 
     //----------------------------------------------------------------------------------------------
     /// Request the current time according to TWS or IB Gateway
-    pub fn req_current_time(&mut self) -> Result<(), IBKRApiLibError> {
+    pub async fn req_current_time(&mut self) -> Result<(), IBKRApiLibError> {
         let version = 2;
 
         let message_id: i32 = OutgoingMessageIds::ReqCurrentTime as i32;
@@ -251,49 +298,63 @@ impl EClient
         msg.push_str(&make_field(&version)?);
 
         debug!("Requesting current time: {}", msg.as_str());
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
     //----------------------------------------------------------------------------------------------
     /// Disconnect from TWS
-    pub fn disconnect(&mut self) -> Result<(), IBKRApiLibError> {
-        if !self.is_connected() {
+    pub async fn disconnect(&mut self) -> Result<(), IBKRApiLibError> {
+        if !self.is_connected().await {
             info!("Already disconnected...");
             return Ok(());
         }
         info!("Disconnect requested.  Shutting down stream...");
+
         self.disconnect_requested.store(true, Ordering::Release);
-        self.stream.as_mut().unwrap().shutdown(Shutdown::Both)?;
-        *self.conn_state.lock().expect(POISONED_MUTEX) = ConnStatus::DISCONNECTED;
+
+        if let Some(stream) = self.stream.as_mut() {
+            let _ = stream.shutdown().await?;
+        } else {
+            // Handle the case where self.stream is None
+            let e = IBKRApiLibError::General("StreamNotAvailable".to_string()); // You'll need to define this error appropriately
+            error!("{}", e.to_string());
+        }
+
+        {
+            let mut conn_state = self.conn_state.lock().await;
+            *conn_state = ConnStatus::DISCONNECTED;
+        }
         Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
     /// Initiates the message exchange between the client application and the TWS/IB Gateway
-    fn start_api(&mut self) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    async fn start_api(&mut self) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 2;
         let mut opt_capab = "".to_string();
-        if self.server_version >= MIN_SERVER_VER_OPTIONAL_CAPABILITIES as i32 {
+        if self.server_version().await >= MIN_SERVER_VER_OPTIONAL_CAPABILITIES as i32 {
             opt_capab = make_field(&self.opt_capab)?;
         }
 
         let msg = format!(
             "{}{}{}{}",
             make_field(&mut (Some(OutgoingMessageIds::StartApi).unwrap() as i32))?,
+            // make_field(&mut version.to_string())?,
             make_field(&mut version.to_string())?,
             make_field(&mut self.client_id.to_string())?,
             opt_capab
         );
+        debug!(msg);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //##############################################################################################
-    //################################### Market Data
-    //##############################################################################################
+//################################### Market Data
+//##############################################################################################
     /// Call this function to request market data. The market data
     /// will be returned by the tick_price and tick_size wrapper events.
     ///
@@ -314,7 +375,7 @@ impl EClient
     /// * regulatory_snapshot - With the US Value Snapshot Bundle for stocks,
     ///                         regulatory snapshots are available for 0.01 USD each.
     /// * mkt_data_options - For internal use only. Use default value XYZ.
-    pub fn req_mkt_data(
+    pub async fn req_mkt_data(
         &mut self,
         req_id: i32,
         contract: &Contract,
@@ -323,9 +384,9 @@ impl EClient
         regulatory_snapshot: bool,
         mkt_data_options: Vec<TagValue>,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_DELTA_NEUTRAL {
+        if self.server_version().await < MIN_SERVER_VER_DELTA_NEUTRAL {
             if let Some(_value) = &contract.delta_neutral_contract {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                     req_id,
@@ -341,7 +402,7 @@ impl EClient
             }
         }
 
-        if self.server_version() < MIN_SERVER_VER_REQ_MKT_DATA_CONID && contract.con_id > 0 {
+        if self.server_version().await < MIN_SERVER_VER_REQ_MKT_DATA_CONID && contract.con_id > 0 {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::NotConnected.code().to_string(),
@@ -350,7 +411,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_TRADING_CLASS && "" != contract.trading_class {
+        if self.server_version().await < MIN_SERVER_VER_TRADING_CLASS && "" != contract.trading_class {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -376,7 +437,7 @@ impl EClient
         msg.push_str(&make_field(&req_id)?);
 
         // send contract fields
-        if self.server_version() >= MIN_SERVER_VER_REQ_MKT_DATA_CONID {
+        if self.server_version().await >= MIN_SERVER_VER_REQ_MKT_DATA_CONID {
             msg.push_str(&make_field(&contract.con_id)?);
             msg.push_str(&make_field(&contract.symbol)?);
 
@@ -391,7 +452,7 @@ impl EClient
             msg.push_str(&make_field(&contract.local_symbol)?); //  srv v2 and above
         }
 
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.trading_class)?);
         }
         // Send combo legs for BAG requests(srv v8 and above)
@@ -406,7 +467,7 @@ impl EClient
             }
         }
 
-        if self.server_version() >= MIN_SERVER_VER_DELTA_NEUTRAL {
+        if self.server_version().await >= MIN_SERVER_VER_DELTA_NEUTRAL {
             if contract.delta_neutral_contract.is_some() {
                 msg.push_str(&make_field(&true)?);
                 msg.push_str(&make_field(
@@ -426,12 +487,12 @@ impl EClient
             msg.push_str(&make_field(&snapshot)?); // srv v35 and above
         }
 
-        if self.server_version() >= MIN_SERVER_VER_REQ_SMART_COMPONENTS {
+        if self.server_version().await >= MIN_SERVER_VER_REQ_SMART_COMPONENTS {
             msg.push_str(&make_field(&regulatory_snapshot)?);
         }
 
         // send mktDataOptions parameter
-        if self.server_version() >= MIN_SERVER_VER_LINKING {
+        if self.server_version().await >= MIN_SERVER_VER_LINKING {
             // current doc says this part is for "internal use only" -> won't support it
             if mkt_data_options.len() > 0 {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
@@ -450,7 +511,7 @@ impl EClient
             msg.push_str(&make_field(&mkt_data_options_str)?);
         }
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -459,8 +520,8 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The ID that was specified in the call to req_mkt_data()
-    pub fn cancel_mkt_data(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+    pub async fn cancel_mkt_data(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(req_id).await?;
 
         let version = 2;
 
@@ -470,7 +531,7 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -487,10 +548,10 @@ impl EClient
     /// * market_data_type
     /// * 1 for real-time streaming market data
     /// * 2 for frozen market data
-    pub fn req_market_data_type(&mut self, market_data_type: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_market_data_type(&mut self, market_data_type: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_MARKET_DATA_TYPE {
+        if self.server_version().await < MIN_SERVER_VER_REQ_MARKET_DATA_TYPE {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -512,7 +573,7 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&market_data_type)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -523,14 +584,14 @@ impl EClient
     ///            market data returns, it will be identified by this tag. This is
     ///            also used when canceling the market data.
     /// * bbo_exchange - mapping identifier received from Wrapper::tick_req_params
-    pub fn req_smart_components(
+    pub async fn req_smart_components(
         &mut self,
         req_id: i32,
         bbo_exchange: &str,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_SMART_COMPONENTS {
+        if self.server_version().await < MIN_SERVER_VER_REQ_SMART_COMPONENTS {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -552,7 +613,7 @@ impl EClient
         msg.push_str(&make_field(&req_id)?);
         msg.push_str(&make_field(&String::from(bbo_exchange))?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -565,10 +626,10 @@ impl EClient
     /// The returned market rule ID list will provide the market rule ID for the instrument in the correspond valid exchange list in contractDetails.
     /// # Arguments
     /// * market_rule_id -  the id of market rule
-    pub fn req_market_rule(&mut self, market_rule_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_market_rule(&mut self, market_rule_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_MARKET_RULES {
+        if self.server_version().await < MIN_SERVER_VER_MARKET_RULES {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -589,7 +650,7 @@ impl EClient
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&market_rule_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -602,7 +663,7 @@ impl EClient
     /// * tick_type	- TickByTickType data type: "Last", "AllLast", "BidAsk" or "MidPoint".
     /// * number_of_ticks	- number of ticks.
     /// * ignore_size	- ignore size flag.
-    pub fn req_tick_by_tick_data(
+    pub async fn req_tick_by_tick_data(
         &mut self,
         req_id: i32,
         contract: &Contract,
@@ -610,9 +671,9 @@ impl EClient
         number_of_ticks: i32,
         ignore_size: bool,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_TICK_BY_TICK {
+        if self.server_version().await < MIN_SERVER_VER_TICK_BY_TICK {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -626,7 +687,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_TICK_BY_TICK_IGNORE_SIZE {
+        if self.server_version().await < MIN_SERVER_VER_TICK_BY_TICK_IGNORE_SIZE {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -662,12 +723,12 @@ impl EClient
         msg.push_str(&make_field(&contract.trading_class)?);
         msg.push_str(&make_field(&(tick_type.to_string()))?);
 
-        if self.server_version() >= MIN_SERVER_VER_TICK_BY_TICK_IGNORE_SIZE {
+        if self.server_version().await >= MIN_SERVER_VER_TICK_BY_TICK_IGNORE_SIZE {
             msg.push_str(&make_field(&number_of_ticks)?);
             msg.push_str(&make_field(&ignore_size)?);
         }
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -676,10 +737,10 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id	- The identifier of the original request.
-    pub fn cancel_tick_by_tick_data(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+    pub async fn cancel_tick_by_tick_data(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_TICK_BY_TICK {
+        if self.server_version().await < MIN_SERVER_VER_TICK_BY_TICK {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -700,13 +761,13 @@ impl EClient
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
-    //##########################################################################
-    //################## Options
-    //##########################################################################
+//##########################################################################
+//################## Options
+//##########################################################################
 
     /// Call this function to calculate volatility for a supplied
     /// option price and underlying price. Result will be delivered
@@ -718,7 +779,7 @@ impl EClient
     /// * option_price - The price of the option.
     /// * under_price - Price of the underlying.
     /// * impl_vol_options - Implied volatility options.
-    pub fn calculate_implied_volatility(
+    pub async fn calculate_implied_volatility(
         &mut self,
         req_id: i32,
         contract: &Contract,
@@ -726,9 +787,9 @@ impl EClient
         under_price: f64,
         impl_vol_options: Vec<TagValue>,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_CALC_IMPLIED_VOLAT {
+        if self.server_version().await < MIN_SERVER_VER_REQ_CALC_IMPLIED_VOLAT {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -742,7 +803,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_TRADING_CLASS && "" != contract.trading_class {
+        if self.server_version().await < MIN_SERVER_VER_TRADING_CLASS && "" != contract.trading_class {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -780,14 +841,14 @@ impl EClient
         msg.push_str(&make_field(&contract.currency)?);
         msg.push_str(&make_field(&contract.local_symbol)?);
 
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.trading_class)?);
         }
 
         msg.push_str(&make_field(&option_price)?);
         msg.push_str(&make_field(&under_price)?);
 
-        if self.server_version() >= MIN_SERVER_VER_LINKING {
+        if self.server_version().await >= MIN_SERVER_VER_LINKING {
             let mut impl_vol_opt_str = "".to_string();
             let tag_values_count = impl_vol_options.len();
             if tag_values_count > 0 {
@@ -801,7 +862,7 @@ impl EClient
         }
         error!("sending calculate_implied_volatility");
         error!("{}", msg);
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -813,7 +874,7 @@ impl EClient
     /// * contract - Describes the contract.
     /// * volatility - The volatility.
     /// * under_price - Price of the underlying.
-    pub fn calculate_option_price(
+    pub async fn calculate_option_price(
         &mut self,
         req_id: i32,
         contract: &Contract,
@@ -821,9 +882,9 @@ impl EClient
         under_price: f64,
         opt_prc_options: Vec<TagValue>,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_CALC_IMPLIED_VOLAT {
+        if self.server_version().await < MIN_SERVER_VER_REQ_CALC_IMPLIED_VOLAT {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -837,7 +898,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await < MIN_SERVER_VER_TRADING_CLASS {
             if "" != contract.trading_class {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                     req_id,
@@ -876,14 +937,14 @@ impl EClient
         msg.push_str(&make_field(&contract.currency)?);
         msg.push_str(&make_field(&contract.local_symbol)?);
 
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.trading_class)?);
         }
 
         msg.push_str(&make_field(&volatility)?);
         msg.push_str(&make_field(&under_price)?);
 
-        if self.server_version() >= MIN_SERVER_VER_LINKING {
+        if self.server_version().await >= MIN_SERVER_VER_LINKING {
             let _opt_prc_opt_str = "".to_string();
             let tag_values_count = opt_prc_options.len();
             if tag_values_count > 0 {
@@ -896,7 +957,7 @@ impl EClient
                 msg.push_str(&make_field(&opt_prc_opt_str)?);
             }
         }
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -906,10 +967,10 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The original request id.
-    pub fn cancel_calculate_option_price(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+    pub async fn cancel_calculate_option_price(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_CALC_IMPLIED_VOLAT {
+        if self.server_version().await < MIN_SERVER_VER_REQ_CALC_IMPLIED_VOLAT {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -933,7 +994,7 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -942,13 +1003,13 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The original request id.
-    pub fn cancel_calculate_implied_volatility(
+    pub async fn cancel_calculate_implied_volatility(
         &mut self,
         req_id: i32,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_CALC_IMPLIED_VOLAT {
+        if self.server_version().await < MIN_SERVER_VER_REQ_CALC_IMPLIED_VOLAT {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -972,7 +1033,7 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -995,7 +1056,7 @@ impl EClient
     ///              Values are:
     ///      * 0 = no
     ///      * 1 = yes.
-    pub fn exercise_options(
+    pub async fn exercise_options(
         &mut self,
         req_id: i32,
         contract: &Contract,
@@ -1004,9 +1065,9 @@ impl EClient
         account: &String,
         over_ride: i32,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await < MIN_SERVER_VER_TRADING_CLASS {
             if !contract.trading_class.is_empty() {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                     req_id,
@@ -1035,7 +1096,7 @@ impl EClient
         msg.push_str(&make_field(&req_id)?);
 
         // send contract fields
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.con_id)?);
         }
         msg.push_str(&make_field(&contract.symbol)?);
@@ -1047,7 +1108,7 @@ impl EClient
         msg.push_str(&make_field(&contract.exchange)?);
         msg.push_str(&make_field(&contract.currency)?);
         msg.push_str(&make_field(&contract.local_symbol)?);
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.trading_class)?);
         }
         msg.push_str(&make_field(&exercise_action)?);
@@ -1055,13 +1116,13 @@ impl EClient
         msg.push_str(&make_field(account)?);
         msg.push_str(&make_field(&over_ride)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
-    //#########################################################################
-    //################## Orders
-    //########################################################################
+//#########################################################################
+//################## Orders
+//########################################################################
 
     /// Call this function to place an order. The order status will
     /// be returned by the Wrapper::order_status event.
@@ -1075,15 +1136,15 @@ impl EClient
     /// * order - This structure contains the details of the order.
     ///
     /// Note: Each client MUST connect with a unique client_id.
-    pub fn place_order(
+    pub async fn place_order(
         &mut self,
         order_id: i32,
         contract: &Contract,
         order: &Order,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_DELTA_NEUTRAL {
+        if self.server_version().await < MIN_SERVER_VER_DELTA_NEUTRAL {
             if contract.delta_neutral_contract.is_some() {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                     NO_VALID_ID,
@@ -1099,7 +1160,7 @@ impl EClient
             }
         }
 
-        if self.server_version() < MIN_SERVER_VER_SCALE_ORDERS2
+        if self.server_version().await < MIN_SERVER_VER_SCALE_ORDERS2
             && order.scale_subs_level_size != UNSET_INTEGER
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
@@ -1115,7 +1176,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_ALGO_ORDERS && !order.algo_strategy.is_empty() {
+        if self.server_version().await < MIN_SERVER_VER_ALGO_ORDERS && !order.algo_strategy.is_empty() {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -1129,7 +1190,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_NOT_HELD && order.not_held {
+        if self.server_version().await < MIN_SERVER_VER_NOT_HELD && order.not_held {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -1143,7 +1204,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_SEC_ID_TYPE
+        if self.server_version().await < MIN_SERVER_VER_SEC_ID_TYPE
             && (!contract.sec_id_type.is_empty() || !contract.sec_id.is_empty())
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
@@ -1159,7 +1220,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_PLACE_ORDER_CONID && contract.con_id > 0 {
+        if self.server_version().await < MIN_SERVER_VER_PLACE_ORDER_CONID && contract.con_id > 0 {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -1173,7 +1234,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_SSHORTX {
+        if self.server_version().await < MIN_SERVER_VER_SSHORTX {
             if order.exempt_code != -1 {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                     order_id,
@@ -1203,7 +1264,7 @@ impl EClient
                 return Err(err);
             }
         }
-        if self.server_version() < MIN_SERVER_VER_HEDGE_ORDERS && !order.hedge_type.is_empty() {
+        if self.server_version().await < MIN_SERVER_VER_HEDGE_ORDERS && !order.hedge_type.is_empty() {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -1217,7 +1278,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_OPT_OUT_SMART_ROUTING
+        if self.server_version().await < MIN_SERVER_VER_OPT_OUT_SMART_ROUTING
             && order.opt_out_smart_routing
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
@@ -1233,11 +1294,11 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_DELTA_NEUTRAL_CONID
+        if self.server_version().await < MIN_SERVER_VER_DELTA_NEUTRAL_CONID
             && (order.delta_neutral_con_id > 0
-                || !order.delta_neutral_settling_firm.is_empty()
-                || !order.delta_neutral_clearing_account.is_empty()
-                || !order.delta_neutral_clearing_intent.is_empty())
+            || !order.delta_neutral_settling_firm.is_empty()
+            || !order.delta_neutral_clearing_account.is_empty()
+            || !order.delta_neutral_clearing_intent.is_empty())
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
@@ -1252,11 +1313,11 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_DELTA_NEUTRAL_OPEN_CLOSE
+        if self.server_version().await < MIN_SERVER_VER_DELTA_NEUTRAL_OPEN_CLOSE
             && (!order.delta_neutral_open_close.is_empty()
-                || order.delta_neutral_short_sale
-                || order.delta_neutral_short_sale_slot > 0
-                || !order.delta_neutral_designated_location.is_empty())
+            || order.delta_neutral_short_sale
+            || order.delta_neutral_short_sale_slot > 0
+            || !order.delta_neutral_designated_location.is_empty())
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
@@ -1271,16 +1332,16 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_SCALE_ORDERS3
+        if self.server_version().await < MIN_SERVER_VER_SCALE_ORDERS3
             && order.scale_price_increment > 0 as f64
             && order.scale_price_increment != UNSET_DOUBLE
             && (order.scale_price_adjust_value != UNSET_DOUBLE
-                || order.scale_price_adjust_interval != UNSET_INTEGER
-                || order.scale_profit_offset != UNSET_DOUBLE
-                || order.scale_auto_reset
-                || order.scale_init_position != UNSET_INTEGER
-                || order.scale_init_fill_qty != UNSET_INTEGER
-                || order.scale_random_percent)
+            || order.scale_price_adjust_interval != UNSET_INTEGER
+            || order.scale_profit_offset != UNSET_DOUBLE
+            || order.scale_auto_reset
+            || order.scale_init_position != UNSET_INTEGER
+            || order.scale_init_fill_qty != UNSET_INTEGER
+            || order.scale_random_percent)
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
@@ -1296,13 +1357,13 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_ORDER_COMBO_LEGS_PRICE
+        if self.server_version().await < MIN_SERVER_VER_ORDER_COMBO_LEGS_PRICE
             && contract.sec_type == "BAG"
             && order.order_combo_legs.len() > 0
             && order
-                .order_combo_legs
-                .iter()
-                .any(|x| x.price != UNSET_DOUBLE)
+            .order_combo_legs
+            .iter()
+            .any(|x| x.price != UNSET_DOUBLE)
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
@@ -1317,7 +1378,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_TRAILING_PERCENT
+        if self.server_version().await < MIN_SERVER_VER_TRAILING_PERCENT
             && order.trailing_percent != UNSET_DOUBLE
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
@@ -1333,7 +1394,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_TRADING_CLASS
+        if self.server_version().await < MIN_SERVER_VER_TRADING_CLASS
             && !contract.trading_class.is_empty()
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
@@ -1349,10 +1410,10 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_SCALE_TABLE
+        if self.server_version().await < MIN_SERVER_VER_SCALE_TABLE
             && (!order.scale_table.is_empty()
-                || !order.active_start_time.is_empty()
-                || !order.active_stop_time.is_empty())
+            || !order.active_start_time.is_empty()
+            || !order.active_stop_time.is_empty())
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
@@ -1367,7 +1428,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_ALGO_ID && order.algo_id != "" {
+        if self.server_version().await < MIN_SERVER_VER_ALGO_ID && order.algo_id != "" {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -1381,7 +1442,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_ORDER_SOLICITED && order.solicited {
+        if self.server_version().await < MIN_SERVER_VER_ORDER_SOLICITED && order.solicited {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -1395,7 +1456,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_MODELS_SUPPORT && !order.model_code.is_empty() {
+        if self.server_version().await < MIN_SERVER_VER_MODELS_SUPPORT && !order.model_code.is_empty() {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -1409,7 +1470,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_EXT_OPERATOR && !order.ext_operator.is_empty() {
+        if self.server_version().await < MIN_SERVER_VER_EXT_OPERATOR && !order.ext_operator.is_empty() {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -1423,7 +1484,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_SOFT_DOLLAR_TIER
+        if self.server_version().await < MIN_SERVER_VER_SOFT_DOLLAR_TIER
             && (!order.soft_dollar_tier.name.is_empty() || !order.soft_dollar_tier.val.is_empty())
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
@@ -1439,7 +1500,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_CASH_QTY && order.cash_qty != 0.0 {
+        if self.server_version().await < MIN_SERVER_VER_CASH_QTY && order.cash_qty != 0.0 {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -1453,7 +1514,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_DECISION_MAKER
+        if self.server_version().await < MIN_SERVER_VER_DECISION_MAKER
             && (!order.mifid2decision_maker.is_empty() || !order.mifid2decision_algo.is_empty())
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
@@ -1469,7 +1530,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_MIFID_EXECUTION
+        if self.server_version().await < MIN_SERVER_VER_MIFID_EXECUTION
             && (!order.mifid2execution_trader.is_empty() || !order.mifid2execution_algo.is_empty())
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
@@ -1485,7 +1546,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_AUTO_PRICE_FOR_HEDGE
+        if self.server_version().await < MIN_SERVER_VER_AUTO_PRICE_FOR_HEDGE
             && order.dont_use_auto_price_for_hedge
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
@@ -1501,7 +1562,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_ORDER_CONTAINER && order.is_oms_container {
+        if self.server_version().await < MIN_SERVER_VER_ORDER_CONTAINER && order.is_oms_container {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -1515,7 +1576,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_PRICE_MGMT_ALGO && order.use_price_mgmt_algo {
+        if self.server_version().await < MIN_SERVER_VER_PRICE_MGMT_ALGO && order.use_price_mgmt_algo {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 order_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -1529,7 +1590,7 @@ impl EClient
             return Err(err);
         }
 
-        let version: i32 = if self.server_version() < MIN_SERVER_VER_NOT_HELD {
+        let version: i32 = if self.server_version().await < MIN_SERVER_VER_NOT_HELD {
             27
         } else {
             45
@@ -1542,14 +1603,14 @@ impl EClient
 
         msg.push_str(&make_field(&message_id)?);
 
-        if self.server_version() < MIN_SERVER_VER_ORDER_CONTAINER {
+        if self.server_version().await < MIN_SERVER_VER_ORDER_CONTAINER {
             msg.push_str(&make_field(&version)?);
         }
 
         msg.push_str(&make_field(&order_id)?);
 
         // send contract fields
-        if self.server_version() >= MIN_SERVER_VER_PLACE_ORDER_CONID {
+        if self.server_version().await >= MIN_SERVER_VER_PLACE_ORDER_CONID {
             msg.push_str(&make_field(&contract.con_id)?);
         }
         msg.push_str(&make_field(&contract.symbol)?);
@@ -1563,11 +1624,11 @@ impl EClient
         msg.push_str(&make_field(&contract.currency)?);
         msg.push_str(&make_field(&contract.local_symbol)?); // srv v2 && above
 
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.trading_class)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_SEC_ID_TYPE {
+        if self.server_version().await >= MIN_SERVER_VER_SEC_ID_TYPE {
             msg.push_str(&make_field(&contract.sec_id_type)?);
             msg.push_str(&make_field(&contract.sec_id)?);
         }
@@ -1575,7 +1636,7 @@ impl EClient
         // send main order fields
         msg.push_str(&make_field(&order.action)?);
 
-        if self.server_version() >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
+        if self.server_version().await >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
             msg.push_str(&make_field(&order.total_quantity)?);
         } else {
             msg.push_str(&make_field(&(order.total_quantity as i32))?);
@@ -1583,7 +1644,7 @@ impl EClient
 
         msg.push_str(&make_field(&order.order_type)?);
 
-        if self.server_version() < MIN_SERVER_VER_ORDER_COMBO_LEGS_PRICE {
+        if self.server_version().await < MIN_SERVER_VER_ORDER_COMBO_LEGS_PRICE {
             msg.push_str(&make_field(if order.lmt_price != UNSET_DOUBLE {
                 &order.lmt_price
             } else {
@@ -1593,7 +1654,7 @@ impl EClient
             msg.push_str(&make_field_handle_empty(&order.lmt_price)?);
         }
 
-        if self.server_version() < MIN_SERVER_VER_TRAILING_PERCENT {
+        if self.server_version().await < MIN_SERVER_VER_TRAILING_PERCENT {
             msg.push_str(&make_field(if order.aux_price != UNSET_DOUBLE {
                 &order.aux_price
             } else {
@@ -1632,7 +1693,7 @@ impl EClient
                     msg.push_str(&make_field(&(combo_leg.open_close as i32))?);
                     msg.push_str(&make_field(&combo_leg.short_sale_slot)?); //srv v35 && above
                     msg.push_str(&make_field(&combo_leg.designated_location)?); // srv v35 && above
-                    if self.server_version() >= MIN_SERVER_VER_SSHORTX_OLD {
+                    if self.server_version().await >= MIN_SERVER_VER_SSHORTX_OLD {
                         msg.push_str(&make_field(&combo_leg.exempt_code)?);
                     }
                 }
@@ -1640,7 +1701,7 @@ impl EClient
         }
 
         // Send order combo legs for BAG requests
-        if self.server_version() >= MIN_SERVER_VER_ORDER_COMBO_LEGS_PRICE
+        if self.server_version().await >= MIN_SERVER_VER_ORDER_COMBO_LEGS_PRICE
             && contract.sec_type == "BAG"
         {
             let order_combo_legs_count = order.order_combo_legs.len();
@@ -1653,7 +1714,7 @@ impl EClient
             }
         }
 
-        if self.server_version() >= MIN_SERVER_VER_SMART_COMBO_ROUTING_PARAMS
+        if self.server_version().await >= MIN_SERVER_VER_SMART_COMBO_ROUTING_PARAMS
             && contract.sec_type == "BAG"
         {
             let smart_combo_routing_params_count = order.smart_combo_routing_params.len();
@@ -1691,7 +1752,7 @@ impl EClient
         msg.push_str(&make_field(&order.fa_percentage)?); // srv v13 && above
         msg.push_str(&make_field(&order.fa_profile)?); // srv v13 && above
 
-        if self.server_version() >= MIN_SERVER_VER_MODELS_SUPPORT {
+        if self.server_version().await >= MIN_SERVER_VER_MODELS_SUPPORT {
             msg.push_str(&make_field(&order.model_code)?);
         }
 
@@ -1699,7 +1760,7 @@ impl EClient
         msg.push_str(&make_field(&order.short_sale_slot)?); // 0 for retail, 1 || 2 for institutions
         msg.push_str(&make_field(&order.designated_location)?); // populate only when shortSaleSlot = 2.
 
-        if self.server_version() >= MIN_SERVER_VER_SSHORTX_OLD {
+        if self.server_version().await >= MIN_SERVER_VER_SSHORTX_OLD {
             msg.push_str(&make_field(&order.exempt_code)?);
         }
 
@@ -1708,7 +1769,7 @@ impl EClient
 
         // srv v19 && above fields
         msg.push_str(&make_field(&order.oca_type)?);
-        //if( self.server_version() < 38) {
+        //if( self.server_version().await < 38) {
         // will never happen
         //      send( /* order.rthOnly */ false);
         //}
@@ -1735,7 +1796,7 @@ impl EClient
         msg.push_str(&make_field(&order.delta_neutral_order_type)?); // srv v28 && above
         msg.push_str(&make_field_handle_empty(&order.delta_neutral_aux_price)?); // srv v28 && above
 
-        if self.server_version() >= MIN_SERVER_VER_DELTA_NEUTRAL_CONID
+        if self.server_version().await >= MIN_SERVER_VER_DELTA_NEUTRAL_CONID
             && !order.delta_neutral_order_type.is_empty()
         {
             msg.push_str(&make_field(&order.delta_neutral_con_id)?);
@@ -1744,7 +1805,7 @@ impl EClient
             msg.push_str(&make_field(&order.delta_neutral_clearing_intent)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_DELTA_NEUTRAL_OPEN_CLOSE
+        if self.server_version().await >= MIN_SERVER_VER_DELTA_NEUTRAL_OPEN_CLOSE
             && order.delta_neutral_order_type != ""
         {
             msg.push_str(&make_field(&order.delta_neutral_open_close)?);
@@ -1757,12 +1818,12 @@ impl EClient
         msg.push_str(&make_field_handle_empty(&order.reference_price_type)?);
         msg.push_str(&make_field_handle_empty(&order.trail_stop_price)?); // srv v30 && above
 
-        if self.server_version() >= MIN_SERVER_VER_TRAILING_PERCENT {
+        if self.server_version().await >= MIN_SERVER_VER_TRAILING_PERCENT {
             msg.push_str(&make_field_handle_empty(&order.trailing_percent)?);
         }
 
         // SCALE orders
-        if self.server_version() >= MIN_SERVER_VER_SCALE_ORDERS2 {
+        if self.server_version().await >= MIN_SERVER_VER_SCALE_ORDERS2 {
             msg.push_str(&make_field_handle_empty(&order.scale_init_level_size)?);
             msg.push_str(&make_field_handle_empty(&order.scale_subs_level_size)?);
         } else {
@@ -1774,7 +1835,7 @@ impl EClient
 
         msg.push_str(&make_field_handle_empty(&order.scale_price_increment)?);
 
-        if self.server_version() >= MIN_SERVER_VER_SCALE_ORDERS3
+        if self.server_version().await >= MIN_SERVER_VER_SCALE_ORDERS3
             && order.scale_price_increment != UNSET_DOUBLE
             && order.scale_price_increment > 0.0
         {
@@ -1789,14 +1850,14 @@ impl EClient
             msg.push_str(&make_field(&order.scale_random_percent)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_SCALE_TABLE {
+        if self.server_version().await >= MIN_SERVER_VER_SCALE_TABLE {
             msg.push_str(&make_field(&order.scale_table)?);
             msg.push_str(&make_field(&order.active_start_time)?);
             msg.push_str(&make_field(&order.active_stop_time)?);
         }
 
         // HEDGE orders
-        if self.server_version() >= MIN_SERVER_VER_HEDGE_ORDERS {
+        if self.server_version().await >= MIN_SERVER_VER_HEDGE_ORDERS {
             msg.push_str(&make_field(&order.hedge_type)?);
 
             if !order.hedge_type.is_empty() {
@@ -1804,20 +1865,20 @@ impl EClient
             }
         }
 
-        if self.server_version() >= MIN_SERVER_VER_OPT_OUT_SMART_ROUTING {
+        if self.server_version().await >= MIN_SERVER_VER_OPT_OUT_SMART_ROUTING {
             msg.push_str(&make_field(&order.opt_out_smart_routing)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_PTA_ORDERS {
+        if self.server_version().await >= MIN_SERVER_VER_PTA_ORDERS {
             msg.push_str(&make_field(&order.clearing_account)?);
             msg.push_str(&make_field(&order.clearing_intent)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_NOT_HELD {
+        if self.server_version().await >= MIN_SERVER_VER_NOT_HELD {
             msg.push_str(&make_field(&order.not_held)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_DELTA_NEUTRAL {
+        if self.server_version().await >= MIN_SERVER_VER_DELTA_NEUTRAL {
             if contract.delta_neutral_contract.is_some() {
                 msg.push_str(&make_field(&true)?);
                 msg.push_str(&make_field(
@@ -1834,7 +1895,7 @@ impl EClient
             }
         }
 
-        if self.server_version() >= MIN_SERVER_VER_ALGO_ORDERS {
+        if self.server_version().await >= MIN_SERVER_VER_ALGO_ORDERS {
             msg.push_str(&make_field(&order.algo_strategy)?);
             if !order.algo_strategy.is_empty() {
                 let algo_params_count = order.algo_params.len();
@@ -1848,14 +1909,14 @@ impl EClient
             }
         }
 
-        if self.server_version() >= MIN_SERVER_VER_ALGO_ID {
+        if self.server_version().await >= MIN_SERVER_VER_ALGO_ID {
             msg.push_str(&make_field(&order.algo_id)?);
         }
 
         msg.push_str(&make_field(&order.what_if)?); // srv v36 && above
 
         // send miscOptions parameter
-        if self.server_version() >= MIN_SERVER_VER_LINKING {
+        if self.server_version().await >= MIN_SERVER_VER_LINKING {
             let misc_options_str = order
                 .order_misc_options
                 .iter()
@@ -1864,16 +1925,16 @@ impl EClient
             msg.push_str(&make_field(&misc_options_str)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_ORDER_SOLICITED {
+        if self.server_version().await >= MIN_SERVER_VER_ORDER_SOLICITED {
             msg.push_str(&make_field(&order.solicited)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_RANDOMIZE_SIZE_AND_PRICE {
+        if self.server_version().await >= MIN_SERVER_VER_RANDOMIZE_SIZE_AND_PRICE {
             msg.push_str(&make_field(&order.randomize_size)?);
             msg.push_str(&make_field(&order.randomize_price)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_PEGGED_TO_BENCHMARK {
+        if self.server_version().await >= MIN_SERVER_VER_PEGGED_TO_BENCHMARK {
             if order.order_type == "PEG BENCH" {
                 msg.push_str(&make_field(&order.reference_contract_id)?);
                 msg.push_str(&make_field(&order.is_pegged_change_amount_decrease)?);
@@ -1905,46 +1966,46 @@ impl EClient
             msg.push_str(&make_field(&order.adjustable_trailing_unit)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_EXT_OPERATOR {
+        if self.server_version().await >= MIN_SERVER_VER_EXT_OPERATOR {
             msg.push_str(&make_field(&order.ext_operator)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_SOFT_DOLLAR_TIER {
+        if self.server_version().await >= MIN_SERVER_VER_SOFT_DOLLAR_TIER {
             msg.push_str(&make_field(&order.soft_dollar_tier.name)?);
             msg.push_str(&make_field(&order.soft_dollar_tier.val)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_CASH_QTY {
+        if self.server_version().await >= MIN_SERVER_VER_CASH_QTY {
             msg.push_str(&make_field(&order.cash_qty)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_DECISION_MAKER {
+        if self.server_version().await >= MIN_SERVER_VER_DECISION_MAKER {
             msg.push_str(&make_field(&order.mifid2decision_maker)?);
             msg.push_str(&make_field(&order.mifid2decision_algo)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_MIFID_EXECUTION {
+        if self.server_version().await >= MIN_SERVER_VER_MIFID_EXECUTION {
             msg.push_str(&make_field(&order.mifid2execution_trader)?);
             msg.push_str(&make_field(&order.mifid2execution_algo)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_AUTO_PRICE_FOR_HEDGE {
+        if self.server_version().await >= MIN_SERVER_VER_AUTO_PRICE_FOR_HEDGE {
             msg.push_str(&make_field(&order.dont_use_auto_price_for_hedge)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_ORDER_CONTAINER {
+        if self.server_version().await >= MIN_SERVER_VER_ORDER_CONTAINER {
             msg.push_str(&make_field(&order.is_oms_container)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_D_PEG_ORDERS {
+        if self.server_version().await >= MIN_SERVER_VER_D_PEG_ORDERS {
             msg.push_str(&make_field(&order.discretionary_up_to_limit_price)?);
         }
 
-        if self.server_version() >= MIN_SERVER_VER_PRICE_MGMT_ALGO {
+        if self.server_version().await >= MIN_SERVER_VER_PRICE_MGMT_ALGO {
             msg.push_str(&make_field_handle_empty(&order.use_price_mgmt_algo)?);
         }
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -1952,8 +2013,8 @@ impl EClient
     /// Call this function to cancel an order.
     /// # Arguments
     /// * order_id - The order ID that was specified previously when placing the order
-    pub fn cancel_order(&mut self, order_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn cancel_order(&mut self, order_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 2;
 
@@ -1965,7 +2026,7 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&order_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -1978,8 +2039,8 @@ impl EClient
     ///        open orders. These orders will be associated with the client and a new
     ///        order_id will be generated. This association will persist over multiple
     ///        API and TWS sessions
-    pub fn req_open_orders(&mut self) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_open_orders(&mut self) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
 
@@ -1990,7 +2051,7 @@ impl EClient
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&version)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -2006,8 +2067,8 @@ impl EClient
     /// * b_auto_bind - If set to TRUE, newly created TWS orders will be implicitly
     ///                 associated with the client.If set to FALSE, no association will be
     ///                 made.
-    pub fn req_auto_open_orders(&mut self, b_auto_bind: bool) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_auto_open_orders(&mut self, b_auto_bind: bool) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
 
@@ -2019,7 +2080,7 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&b_auto_bind)?); // TRUE = subscribe, FALSE = unsubscribe
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
 
         Ok(())
     }
@@ -2030,8 +2091,8 @@ impl EClient
     /// open_order() and order_status() functions on the EWrapper.
     /// Note:  No association is made between the returned orders and the
     /// requesting client.
-    pub fn req_all_open_orders(&mut self) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_all_open_orders(&mut self) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
 
@@ -2042,7 +2103,7 @@ impl EClient
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&version)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
 
         Ok(())
     }
@@ -2052,8 +2113,8 @@ impl EClient
     /// cancels both API and TWS open orders.
     /// If the order was created in TWS, it also gets canceled. If the order
     /// was initiated in the API client, it also gets canceled.
-    pub fn req_global_cancel(&mut self) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_global_cancel(&mut self) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
 
@@ -2064,7 +2125,7 @@ impl EClient
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&version)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
 
         Ok(())
     }
@@ -2078,8 +2139,8 @@ impl EClient
     ///
     /// # Arguments
     /// * num_ids - deprecated
-    pub fn req_ids(&mut self, num_ids: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_ids(&mut self, num_ids: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
         info!("req_ids is connected...");
         let version = 1;
 
@@ -2091,13 +2152,13 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&num_ids)?);
         info!("req_ids... sending request...");
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //#########################################################################
-    //################## Account and Portfolio
-    //#########################################################################
+//################## Account and Portfolio
+//#########################################################################
     /// Call this function to start getting account values, portfolio,
     /// and last update time information via Wrapper.update_account_value());
     /// Wrapper.update_portfolio() and Wrapper.update_account_time().
@@ -2108,7 +2169,7 @@ impl EClient
     ///               and Portfoliolio updates. If set to FALSE, the client will stop
     ///               receiving this information.
     /// * acct_code - The account code for which to receive account and portfolio updates.
-    pub fn req_account_updates(
+    pub async fn req_account_updates(
         &mut self,
         subscribe: bool,
         acct_code: &str,
@@ -2119,7 +2180,7 @@ impl EClient
             subscribe, acct_code
         );
 
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 2;
 
@@ -2132,7 +2193,7 @@ impl EClient
         msg.push_str(&make_field(&subscribe)?); // TRUE = subscribe, FALSE = unsubscribe
         msg.push_str(&make_field(&String::from(acct_code))?); // srv v9 and above, the account code.This will only be used for FA clients
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
 
         Ok(())
     }
@@ -2152,13 +2213,13 @@ impl EClient
     ///                accounts, or set to a specific Advisor Account Group name that has
     ///                already been created in TWS Global Configuration.
     /// * tags- A comma-separated list of account tags.  See the AccountSummaryTags enum for valid values
-    pub fn req_account_summary(
+    pub async fn req_account_summary(
         &mut self,
         req_id: i32,
         group_name: &str,
         tags: &str,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 2;
 
@@ -2171,7 +2232,7 @@ impl EClient
         msg.push_str(&make_field(&String::from(group_name))?);
         msg.push_str(&make_field(&String::from(tags))?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -2180,8 +2241,8 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The ID of the data request being canceled.
-    pub fn cancel_account_summary(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+    pub async fn cancel_account_summary(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(req_id).await?;
         let version = 1;
 
         let message_id: i32 = OutgoingMessageIds::CancelAccountSummary as i32;
@@ -2190,17 +2251,17 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
 
         Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
     /// Requests real-time position data for all accounts.
-    pub fn req_positions(&mut self) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_positions(&mut self) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_POSITIONS {
+        if self.server_version().await < MIN_SERVER_VER_POSITIONS {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -2221,17 +2282,17 @@ impl EClient
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&version)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
 
         Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
     /// Cancels real-time position updates.
-    pub fn cancel_positions(&mut self) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn cancel_positions(&mut self) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_POSITIONS {
+        if self.server_version().await < MIN_SERVER_VER_POSITIONS {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -2251,7 +2312,7 @@ impl EClient
         let mut msg = "".to_string();
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&version)?);
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
 
         Ok(())
     }
@@ -2265,15 +2326,15 @@ impl EClient
     /// * account - If an account Id is provided, only the account's positions belonging to the
     ///             specified model will be delivered
     /// * modelCode	- The code of the model's positions we are interested in.
-    pub fn req_positions_multi(
+    pub async fn req_positions_multi(
         &mut self,
         req_id: i32,
         account: &str,
         model_code: &str,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_POSITIONS {
+        if self.server_version().await < MIN_SERVER_VER_POSITIONS {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -2299,7 +2360,7 @@ impl EClient
         msg.push_str(&make_field(&String::from(mut_account))?);
         msg.push_str(&make_field(&String::from(mut_model_code))?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
 
         Ok(())
     }
@@ -2309,10 +2370,10 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The id of the original request
-    pub fn cancel_positions_multi(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+    pub async fn cancel_positions_multi(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_POSITIONS {
+        if self.server_version().await < MIN_SERVER_VER_POSITIONS {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -2334,7 +2395,7 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&mut_req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -2347,16 +2408,16 @@ impl EClient
     /// * model_code - values can also be requested for a model
     /// * ledger_and_nvl - returns light-weight request; only currency positions as opposed to
     ///                    account values and currency positions
-    pub fn req_account_updates_multi(
+    pub async fn req_account_updates_multi(
         &mut self,
         req_id: i32,
         account: &str,
         model_code: &str,
         ledger_and_nlv: bool,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_MODELS_SUPPORT {
+        if self.server_version().await < MIN_SERVER_VER_MODELS_SUPPORT {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -2385,7 +2446,7 @@ impl EClient
         msg.push_str(&make_field(&String::from(mut_model_code))?);
         msg.push_str(&make_field(&mut_ledger_and_nlv)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
 
         Ok(())
     }
@@ -2395,10 +2456,10 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The id of the original request
-    pub fn cancel_account_updates_multi(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+    pub async fn cancel_account_updates_multi(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_MODELS_SUPPORT {
+        if self.server_version().await < MIN_SERVER_VER_MODELS_SUPPORT {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -2420,27 +2481,27 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&mut_req_id)?);
 
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
     //#########################################################################
-    //################## Daily PnL
-    //#########################################################################
+//################## Daily PnL
+//#########################################################################
     /// Requests profit and loss for account and/or model.
     ///
     /// # Arguments
     /// * req_id - identifier to tag the request
     /// * account - account values can be requested for a particular account
     /// * model_code - values can also be requested for a model
-    pub fn req_pnl(
+    pub async fn req_pnl(
         &mut self,
         req_id: i32,
         account: &str,
         model_code: &str,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_PNL {
+        if self.server_version().await < MIN_SERVER_VER_PNL {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -2461,7 +2522,7 @@ impl EClient
         msg.push_str(&make_field(&String::from(account))?);
         msg.push_str(&make_field(&String::from(model_code))?);
 
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
     //----------------------------------------------------------------------------------------------
@@ -2469,10 +2530,10 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The id of the original request
-    pub fn cancel_pnl(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+    pub async fn cancel_pnl(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_PNL {
+        if self.server_version().await < MIN_SERVER_VER_PNL {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -2491,7 +2552,7 @@ impl EClient
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
     //----------------------------------------------------------------------------------------------
@@ -2502,16 +2563,16 @@ impl EClient
     /// * account - account values can be requested for a particular account
     /// * model_code - values can also be requested for a model
     /// * con_id - contract id of the specific contact of interest
-    pub fn req_pnl_single(
+    pub async fn req_pnl_single(
         &mut self,
         req_id: i32,
         account: &str,
         model_code: &str,
         con_id: i32,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_PNL {
+        if self.server_version().await < MIN_SERVER_VER_PNL {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -2533,7 +2594,7 @@ impl EClient
         msg.push_str(&make_field(&String::from(model_code))?);
         msg.push_str(&make_field(&con_id)?);
 
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
     //----------------------------------------------------------------------------------------------
@@ -2541,10 +2602,10 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The id of the original request
-    pub fn cancel_pnl_single(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+    pub async fn cancel_pnl_single(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_PNL {
+        if self.server_version().await < MIN_SERVER_VER_PNL {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -2563,12 +2624,12 @@ impl EClient
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
-    //#########################################################################
-    //################## Executions
-    //#########################################################################
+//#########################################################################
+//################## Executions
+//#########################################################################
 
     /// When this function is called, the execution reports that meet the
     /// filter criteria are downloaded to the client via the execDetails()
@@ -2584,19 +2645,19 @@ impl EClient
     ///                 reports are returned.
     ///
     /// NOTE: Time format must be 'yyyymmdd-hh:mm:ss' Eg: '20030702-14:55'
-    pub fn req_executions(
+    pub async fn req_executions(
         &mut self,
         req_id: i32,
         exec_filter: &ExecutionFilter,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
         let version = 3;
         let message_id: i32 = OutgoingMessageIds::ReqExecutions as i32;
         let mut msg = "".to_string();
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&version)?);
-        if self.server_version() >= MIN_SERVER_VER_EXECUTION_DATA_CHAIN {
+        if self.server_version().await >= MIN_SERVER_VER_EXECUTION_DATA_CHAIN {
             msg.push_str(&make_field(&req_id)?);
         }
         msg.push_str(&make_field(&exec_filter.client_id)?);
@@ -2607,29 +2668,29 @@ impl EClient
         msg.push_str(&make_field(&exec_filter.exchange)?);
         msg.push_str(&make_field(&exec_filter.side)?);
 
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
     //#########################################################################
-    //################## Contract Details
-    //#########################################################################
+//################## Contract Details
+//#########################################################################
     /// Call this function to download all details for a particular
     /// underlying. The contract details will be received via the contractDetails()
     /// function on the EWrapper.
     ///
-    ///    
+    ///
     /// # Arguments
     /// * req_id - The ID of the data request. Ensures that responses are
     ///            matched to requests if several requests are in process.
     /// * contract - The summary description of the contract being looked up.
-    pub fn req_contract_details(
+    pub async fn req_contract_details(
         &mut self,
         req_id: i32,
         contract: &Contract,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
-        if self.server_version() < MIN_SERVER_VER_SEC_ID_TYPE {
+        if self.server_version().await < MIN_SERVER_VER_SEC_ID_TYPE {
             if contract.sec_id_type != "" || contract.sec_id != "" {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                     req_id,
@@ -2645,7 +2706,7 @@ impl EClient
             }
         }
 
-        if self.server_version() < MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await < MIN_SERVER_VER_TRADING_CLASS {
             if contract.trading_class != "" {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                     req_id,
@@ -2661,7 +2722,7 @@ impl EClient
             }
         }
 
-        if self.server_version() < MIN_SERVER_VER_LINKING {
+        if self.server_version().await < MIN_SERVER_VER_LINKING {
             if contract.primary_exchange != "" {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                     req_id,
@@ -2684,7 +2745,7 @@ impl EClient
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&version)?);
 
-        if self.server_version() >= MIN_SERVER_VER_CONTRACT_DATA_CHAIN {
+        if self.server_version().await >= MIN_SERVER_VER_CONTRACT_DATA_CHAIN {
             msg.push_str(&make_field(&req_id)?);
         }
 
@@ -2698,10 +2759,10 @@ impl EClient
         msg.push_str(&make_field(&contract.right)?);
         msg.push_str(&make_field(&contract.multiplier)?); // srv v15 and above
 
-        if self.server_version() >= MIN_SERVER_VER_PRIMARYEXCH {
+        if self.server_version().await >= MIN_SERVER_VER_PRIMARYEXCH {
             msg.push_str(&make_field(&contract.exchange)?);
             msg.push_str(&make_field(&contract.primary_exchange)?);
-        } else if self.server_version() >= MIN_SERVER_VER_LINKING {
+        } else if self.server_version().await >= MIN_SERVER_VER_LINKING {
             if contract.primary_exchange != ""
                 && (contract.exchange == "BEST" || contract.exchange == "SMART")
             {
@@ -2717,27 +2778,27 @@ impl EClient
         msg.push_str(&make_field(&contract.currency)?);
         msg.push_str(&make_field(&contract.local_symbol)?);
 
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.trading_class)?);
             msg.push_str(&make_field(&contract.include_expired)?); // srv v31 and above
         }
 
-        if self.server_version() >= MIN_SERVER_VER_SEC_ID_TYPE {
+        if self.server_version().await >= MIN_SERVER_VER_SEC_ID_TYPE {
             msg.push_str(&make_field(&contract.sec_id_type)?);
             msg.push_str(&make_field(&contract.sec_id)?);
         }
 
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
     //#########################################################################
-    //################## Market Depth
-    //#########################################################################
+//################## Market Depth
+//#########################################################################
     /// Requests venues for which market data is returned to update_mkt_depth_l2 (those with market makers)
-    pub fn req_mkt_depth_exchanges(&mut self) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_mkt_depth_exchanges(&mut self) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_MKT_DEPTH_EXCHANGES {
+        if self.server_version().await < MIN_SERVER_VER_REQ_MKT_DEPTH_EXCHANGES {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -2755,7 +2816,7 @@ impl EClient
         let mut msg = "".to_string();
         msg.push_str(&make_field(&message_id)?);
 
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
     //----------------------------------------------------------------------------------------------
@@ -2779,7 +2840,7 @@ impl EClient
     ///                    THERE SEEMS TO BE A BUG ON IB's SIDE AND THEY WILL STOP STREAMING
     ///                    DATA IF THIS IS SET TO TRUE
     /// * mkt_depth_options - For internal use only. Use default value XYZ.
-    pub fn req_mkt_depth(
+    pub async fn req_mkt_depth(
         &mut self,
         req_id: i32,
         contract: &Contract,
@@ -2787,9 +2848,9 @@ impl EClient
         is_smart_depth: bool,
         mkt_depth_options: Vec<TagValue>,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await < MIN_SERVER_VER_TRADING_CLASS {
             if &contract.trading_class != "" || *&contract.con_id > 0 {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                     req_id,
@@ -2805,7 +2866,7 @@ impl EClient
             }
         }
 
-        if self.server_version() < MIN_SERVER_VER_SMART_DEPTH && is_smart_depth {
+        if self.server_version().await < MIN_SERVER_VER_SMART_DEPTH && is_smart_depth {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -2819,7 +2880,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_MKT_DEPTH_PRIM_EXCHANGE
+        if self.server_version().await < MIN_SERVER_VER_MKT_DEPTH_PRIM_EXCHANGE
             && contract.primary_exchange != ""
         {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
@@ -2846,7 +2907,7 @@ impl EClient
         msg.push_str(&make_field(&req_id)?);
 
         // send contract fields
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.con_id)?);
         }
         msg.push_str(&make_field(&contract.symbol)?);
@@ -2857,22 +2918,22 @@ impl EClient
         msg.push_str(&make_field(&contract.multiplier)?); // srv v15 and above
         msg.push_str(&make_field(&contract.exchange)?);
 
-        if self.server_version() >= MIN_SERVER_VER_MKT_DEPTH_PRIM_EXCHANGE {
+        if self.server_version().await >= MIN_SERVER_VER_MKT_DEPTH_PRIM_EXCHANGE {
             msg.push_str(&make_field(&contract.primary_exchange)?);
         }
         msg.push_str(&make_field(&contract.currency)?);
         msg.push_str(&make_field(&contract.local_symbol)?);
 
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.trading_class)?);
         }
         msg.push_str(&make_field(&num_rows)?); // srv v19 and above
 
-        if self.server_version() >= MIN_SERVER_VER_SMART_DEPTH {
+        if self.server_version().await >= MIN_SERVER_VER_SMART_DEPTH {
             msg.push_str(&make_field(&is_smart_depth)?);
         }
         // send mkt_depth_options parameter
-        if self.server_version() >= MIN_SERVER_VER_LINKING {
+        if self.server_version().await >= MIN_SERVER_VER_LINKING {
             // current doc says this part if for "internal use only" -> won't support it
             if mkt_depth_options.len() > 0 {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
@@ -2890,7 +2951,7 @@ impl EClient
             let mkt_data_options_str = "";
             msg.push_str(&make_field(&mkt_data_options_str)?);
         }
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
     //----------------------------------------------------------------------------------------------
@@ -2899,16 +2960,16 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The ID that was specified in the call to req_mkt_depth().
-    //  * is_smart_depth - specifies SMART depth request
-    //
-    pub fn cancel_mkt_depth(
+//  * is_smart_depth - specifies SMART depth request
+//
+    pub async fn cancel_mkt_depth(
         &mut self,
         req_id: i32,
         is_smart_depth: bool,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_SMART_DEPTH && is_smart_depth {
+        if self.server_version().await < MIN_SERVER_VER_SMART_DEPTH && is_smart_depth {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -2930,25 +2991,25 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&req_id)?);
 
-        if self.server_version() >= MIN_SERVER_VER_SMART_DEPTH {
+        if self.server_version().await >= MIN_SERVER_VER_SMART_DEPTH {
             msg.push_str(&make_field(&is_smart_depth)?);
         }
 
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
     //#########################################################################
-    //################## News Bulletins
-    //#########################################################################
+//################## News Bulletins
+//#########################################################################
     /// Call this function to start receiving news bulletins. Each bulletin
     /// will be returned by the update_news_bulletin() event.
-    //
+//
     /// # Arguments
     /// * all_msgs - If set to TRUE, returns all the existing bulletins for
-    //               the current day and any new ones. If set to FALSE, will only
-    //               return new bulletins.
-    pub fn req_news_bulletins(&mut self, all_msgs: bool) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+//               the current day and any new ones. If set to FALSE, will only
+//               return new bulletins.
+    pub async fn req_news_bulletins(&mut self, all_msgs: bool) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
 
@@ -2958,14 +3019,14 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&all_msgs)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
     ///Call this function to stop receiving news bulletins.
-    pub fn cancel_news_bulletins(&mut self) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn cancel_news_bulletins(&mut self) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
 
@@ -2973,26 +3034,26 @@ impl EClient
         let mut msg = "".to_string();
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&version)?);
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //#########################################################################
-    //################## Financial Advisors
-    //#########################################################################
+//################## Financial Advisors
+//#########################################################################
     /// Call this function to request the list of managed accounts. The list
     /// will be returned by the managed_accounts() function on the Wrapper.
     ///
     /// Note:  This request can only be made when connected to a FA managed account.
-    pub fn req_managed_accts(&mut self) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_managed_accts(&mut self) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
         let message_id: i32 = OutgoingMessageIds::ReqManagedAccts as i32;
         let mut msg = "".to_string();
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&version)?);
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
     //----------------------------------------------------------------------------------------------
@@ -3004,8 +3065,8 @@ impl EClient
     ///     * 1 = GROUPS
     ///     * 2 = PROFILE
     ///     * 3 = ACCOUNT ALIASES
-    pub fn request_fa(&mut self, fa_data: FaDataType) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn request_fa(&mut self, fa_data: FaDataType) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
         let message_id: i32 = OutgoingMessageIds::ReqFa as i32;
@@ -3014,7 +3075,7 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&(fa_data as i32))?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -3029,8 +3090,8 @@ impl EClient
     ///     * 3 = ACCOUNT ALIASES
     /// *cxml - The XML string containing the new FA configuration
     ///         information.
-    pub fn replace_fa(&mut self, fa_data: FaDataType, cxml: &str) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn replace_fa(&mut self, fa_data: FaDataType, cxml: &str) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
         let message_id: i32 = OutgoingMessageIds::ReplaceFa as i32;
@@ -3041,12 +3102,12 @@ impl EClient
         msg.push_str(&make_field(&fa_data)?);
         msg.push_str(&make_field(&String::from(cxml))?);
 
-        self.send_request(msg.as_str())
+        self.send_request(msg.as_str()).await
     }
 
     //#########################################################################
-    //################## Historical Data
-    //#########################################################################
+//################## Historical Data
+//#########################################################################
     /// Requests contracts' historical data. When requesting historical data, a
     /// finishing time and date is required along with a duration string. The
     /// resulting bars will be returned in EWrapper.historicalData()
@@ -3098,7 +3159,7 @@ impl EClient
     ///     * 1 - dates applying to bars returned in the format: yyyymmdd{space}{space}hh:mm:dd
     ///     * 2 - dates are returned as a long integer specifying the number of seconds since 1/1/1970 GMT.
     /// *chart_options: - For internal use only. Use default value XYZ.
-    pub fn req_historical_data(
+    pub async fn req_historical_data(
         &mut self,
         req_id: i32,
         contract: &Contract,
@@ -3111,9 +3172,9 @@ impl EClient
         keep_up_to_date: bool,
         chart_options: Vec<TagValue>,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await < MIN_SERVER_VER_TRADING_CLASS {
             if &contract.trading_class != "" || contract.con_id > 0 {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                     req_id,
@@ -3136,14 +3197,14 @@ impl EClient
         let mut msg = "".to_string();
         msg.push_str(&make_field(&message_id)?);
 
-        if self.server_version() < MIN_SERVER_VER_SYNT_REALTIME_BARS {
+        if self.server_version().await < MIN_SERVER_VER_SYNT_REALTIME_BARS {
             msg.push_str(&make_field(&version)?);
         }
 
         msg.push_str(&make_field(&req_id)?);
 
         // Send contract fields
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.con_id)?);
             msg.push_str(&make_field(&contract.symbol)?);
             msg.push_str(&make_field(&contract.sec_type)?);
@@ -3156,7 +3217,7 @@ impl EClient
             msg.push_str(&make_field(&contract.currency)?);
             msg.push_str(&make_field(&contract.local_symbol)?);
         }
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.trading_class)?);
         }
         msg.push_str(&make_field(&contract.include_expired)?); // srv v31 and above
@@ -3178,11 +3239,11 @@ impl EClient
                 msg.push_str(&make_field(&combo_leg.exchange)?);
             }
         }
-        if self.server_version() >= MIN_SERVER_VER_SYNT_REALTIME_BARS {
+        if self.server_version().await >= MIN_SERVER_VER_SYNT_REALTIME_BARS {
             msg.push_str(&make_field(&keep_up_to_date)?);
         }
         // Send chart_options parameter
-        if self.server_version() >= MIN_SERVER_VER_LINKING {
+        if self.server_version().await >= MIN_SERVER_VER_LINKING {
             let chart_options_str = chart_options
                 .iter()
                 .map(|x| format!("{}={};", x.tag, x.value))
@@ -3190,7 +3251,7 @@ impl EClient
             msg.push_str(&make_field(&chart_options_str)?);
         }
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -3201,8 +3262,8 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - the id of the original request
-    pub fn cancel_historical_data(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn cancel_historical_data(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
 
@@ -3213,7 +3274,7 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
 
         Ok(())
     }
@@ -3230,7 +3291,7 @@ impl EClient
     ///
     /// Note that formatData parameter affects intraday bars only
     /// 1-day bars always return with date in YYYYMMDD format
-    pub fn req_head_time_stamp(
+    pub async fn req_head_time_stamp(
         &mut self,
         req_id: i32,
         contract: &Contract,
@@ -3238,9 +3299,9 @@ impl EClient
         use_rth: i32,
         format_date: i32,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_HEAD_TIMESTAMP {
+        if self.server_version().await < MIN_SERVER_VER_REQ_HEAD_TIMESTAMP {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -3276,7 +3337,7 @@ impl EClient
         msg.push_str(&make_field(&String::from(what_to_show))?);
         msg.push_str(&make_field(&format_date)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -3285,10 +3346,10 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - the id of the original request
-    pub fn cancel_head_time_stamp(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn cancel_head_time_stamp(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_CANCEL_HEADTIMESTAMP {
+        if self.server_version().await < MIN_SERVER_VER_CANCEL_HEADTIMESTAMP {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -3308,7 +3369,7 @@ impl EClient
 
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -3320,16 +3381,16 @@ impl EClient
     /// * contract - Contract object for which histogram is being requested
     /// * use_rth - use regular trading hours only, 1 for yes or 0 for no
     /// * time_period - period of which data is being requested, e.g. "3 days"
-    pub fn req_histogram_data(
+    pub async fn req_histogram_data(
         &mut self,
         ticker_id: i32,
         contract: &Contract,
         use_rth: bool,
         time_period: &str,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_HISTOGRAM {
+        if self.server_version().await < MIN_SERVER_VER_REQ_HISTOGRAM {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -3364,7 +3425,7 @@ impl EClient
         msg.push_str(&make_field(&use_rth)?);
         msg.push_str(&make_field(&String::from(time_period))?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -3373,10 +3434,10 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - the id of the original request
-    pub fn cancel_histogram_data(&mut self, ticker_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn cancel_histogram_data(&mut self, ticker_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_HISTOGRAM {
+        if self.server_version().await < MIN_SERVER_VER_REQ_HISTOGRAM {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -3395,7 +3456,7 @@ impl EClient
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&ticker_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -3412,7 +3473,7 @@ impl EClient
     /// * use_rth - Data from regular trading hours (1), or all available hours (0)
     /// * ignore_size - A filter only used when the source price is Bid_Ask
     /// * misc_options - should be defined as null, reserved for internal use
-    pub fn req_historical_ticks(
+    pub async fn req_historical_ticks(
         &mut self,
         req_id: i32,
         contract: &Contract,
@@ -3424,9 +3485,9 @@ impl EClient
         ignore_size: bool,
         misc_options: Vec<TagValue>,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_HISTORICAL_TICKS {
+        if self.server_version().await < MIN_SERVER_VER_HISTORICAL_TICKS {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -3472,19 +3533,19 @@ impl EClient
 
         msg.push_str(&make_field(&misc_options_string)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //#########################################################################
-    //################## Market Scanners
-    //#########################################################################
+//################## Market Scanners
+//#########################################################################
     /// Requests an XML list of scanner parameters valid in TWS.
     /// Not all parameters are valid from API scanner.
-    pub fn req_scanner_parameters(&mut self) -> Result<(), IBKRApiLibError> {
+    pub async fn req_scanner_parameters(&mut self) -> Result<(), IBKRApiLibError> {
         /*Requests an XML string that describes all possible scanner queries*/
 
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
         let message_id: i32 = OutgoingMessageIds::ReqScannerParameters as i32;
@@ -3492,7 +3553,7 @@ impl EClient
         msg.push_str(&make_field(&message_id)?);
         msg.push_str(&make_field(&version)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -3503,17 +3564,17 @@ impl EClient
     /// * req_id - The ticker ID. Must be a unique value.
     /// * subscription - This structure contains possible parameters used to filter results.
     /// * scanner_subscription_options -  For internal use only. Use default value XYZ
-    pub fn req_scanner_subscription(
+    pub async fn req_scanner_subscription(
         &mut self,
         req_id: i32,
         subscription: ScannerSubscription,
         scanner_subscription_options: Vec<TagValue>,
         scanner_subscription_filter_options: Vec<TagValue>,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(req_id)?;
+        self.check_connected(req_id).await?;
 
-        error!("Server version: {}", self.server_version());
-        if self.server_version() < MIN_SERVER_VER_SCANNER_GENERIC_OPTS {
+        error!("Server version: {}", self.server_version().await);
+        if self.server_version().await < MIN_SERVER_VER_SCANNER_GENERIC_OPTS {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -3533,7 +3594,7 @@ impl EClient
         let mut msg = "".to_string();
         msg.push_str(&make_field(&message_id)?);
 
-        if self.server_version() < MIN_SERVER_VER_SCANNER_GENERIC_OPTS {
+        if self.server_version().await < MIN_SERVER_VER_SCANNER_GENERIC_OPTS {
             msg.push_str(&make_field(&version)?);
         }
         msg.push_str(&make_field(&req_id)?);
@@ -3562,7 +3623,7 @@ impl EClient
         msg.push_str(&make_field(&subscription.stock_type_filter)?); // srv v27 and above
 
         // Send scanner_subscription_filter_options parameter
-        if self.server_version() >= MIN_SERVER_VER_SCANNER_GENERIC_OPTS {
+        if self.server_version().await >= MIN_SERVER_VER_SCANNER_GENERIC_OPTS {
             error!("!!!!!!!! making scanner options");
             let scanner_subscription_filter = scanner_subscription_filter_options
                 .iter()
@@ -3572,7 +3633,7 @@ impl EClient
             msg.push_str(&make_field(&scanner_subscription_filter)?);
         }
         // Send scanner_subscription_options parameter
-        if self.server_version() >= MIN_SERVER_VER_LINKING {
+        if self.server_version().await >= MIN_SERVER_VER_LINKING {
             let scanner_subscription_options = scanner_subscription_options
                 .iter()
                 .map(|x| format!("{}={};", x.tag, x.value))
@@ -3581,7 +3642,7 @@ impl EClient
         }
         error!("req_scanner_subscription");
         error!("{}", msg);
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -3590,10 +3651,10 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - the id of the original request
-    pub fn cancel_scanner_subscription(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+    pub async fn cancel_scanner_subscription(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
         /*reqId:i32 - The ticker ID. Must be a unique value*/
 
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
 
@@ -3604,13 +3665,13 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //#########################################################################
-    //################## Real Time Bars
-    //#########################################################################
+//################## Real Time Bars
+//#########################################################################
     /// Call the req_real_time_bars() function to start receiving real time bar
     /// results through the realtimeBar() EWrapper function.
     ///
@@ -3636,7 +3697,7 @@ impl EClient
     ///                        requested is returned, even if the time time span falls
     ///                        partially or completely outside.
     /// * real_time_bars_options: - For internal use only. Use pub fnault value XYZ
-    pub fn req_real_time_bars(
+    pub async fn req_real_time_bars(
         &mut self,
         req_id: i32,
         contract: &Contract,
@@ -3645,9 +3706,9 @@ impl EClient
         use_rth: bool,
         real_time_bars_options: Vec<TagValue>,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await < MIN_SERVER_VER_TRADING_CLASS {
             if !contract.trading_class.is_empty() {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                     NO_VALID_ID,
@@ -3673,7 +3734,7 @@ impl EClient
         msg.push_str(&make_field(&req_id)?);
 
         // Send contract fields
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.con_id)?);
         }
         msg.push_str(&make_field(&contract.symbol)?);
@@ -3686,7 +3747,7 @@ impl EClient
         msg.push_str(&make_field(&contract.primary_exchange)?);
         msg.push_str(&make_field(&contract.currency)?);
         msg.push_str(&make_field(&contract.local_symbol)?);
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.trading_class)?);
         }
         msg.push_str(&make_field(&bar_size)?);
@@ -3694,7 +3755,7 @@ impl EClient
         msg.push_str(&make_field(&use_rth)?);
 
         // Send real_time_bars_options parameter
-        if self.server_version() >= MIN_SERVER_VER_LINKING {
+        if self.server_version().await >= MIN_SERVER_VER_LINKING {
             let real_time_bars_options_str = real_time_bars_options
                 .iter()
                 .map(|x| format!("{}={};", x.tag, x.value))
@@ -3703,7 +3764,7 @@ impl EClient
             msg.push_str(&make_field(&real_time_bars_options_str)?);
         }
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -3712,8 +3773,8 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The Id that was specified in the call to req_real_time_bars().
-    pub fn cancel_real_time_bars(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn cancel_real_time_bars(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 1;
 
@@ -3725,13 +3786,13 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //#########################################################################
-    //################## Fundamental Data
-    //#########################################################################
+//################## Fundamental Data
+//#########################################################################
     /// Call this function to receive fundamental data for
     /// stocks. The appropriate market data subscription must be set up in
     /// Account Management before you can receive this data.
@@ -3754,18 +3815,18 @@ impl EClient
     ///     * ReportsFinStatements (financial statements)
     ///     * RESC (analyst estimates)
     ///     * CalendarReport (company calendar)
-    pub fn req_fundamental_data(
+    pub async fn req_fundamental_data(
         &mut self,
         req_id: i32,
         contract: &Contract,
         report_type: &str,
         fundamental_data_options: Vec<TagValue>,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
         let version = 2;
 
-        if self.server_version() < MIN_SERVER_VER_FUNDAMENTAL_DATA {
+        if self.server_version().await < MIN_SERVER_VER_FUNDAMENTAL_DATA {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -3779,7 +3840,7 @@ impl EClient
             return Err(err);
         }
 
-        if self.server_version() < MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await < MIN_SERVER_VER_TRADING_CLASS {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -3801,7 +3862,7 @@ impl EClient
         msg.push_str(&make_field(&req_id)?);
 
         // Send contract fields
-        if self.server_version() >= MIN_SERVER_VER_TRADING_CLASS {
+        if self.server_version().await >= MIN_SERVER_VER_TRADING_CLASS {
             msg.push_str(&make_field(&contract.con_id)?);
         }
         msg.push_str(&make_field(&contract.symbol)?);
@@ -3812,7 +3873,7 @@ impl EClient
         msg.push_str(&make_field(&contract.local_symbol)?);
         msg.push_str(&make_field(&String::from(report_type))?);
 
-        if self.server_version() >= MIN_SERVER_VER_LINKING {
+        if self.server_version().await >= MIN_SERVER_VER_LINKING {
             let tags_value_count = fundamental_data_options.len();
             let fund_data_opt_str = fundamental_data_options
                 .iter()
@@ -3823,7 +3884,7 @@ impl EClient
             msg.push_str(&make_field(&fund_data_opt_str)?);
         }
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -3832,10 +3893,10 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The ID of the data request
-    pub fn cancel_fundamental_data(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn cancel_fundamental_data(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_FUNDAMENTAL_DATA {
+        if self.server_version().await < MIN_SERVER_VER_FUNDAMENTAL_DATA {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -3858,19 +3919,19 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //########################################################################
-    //################## News
-    //#########################################################################
+//################## News
+//#########################################################################
     /// Requests all open orders places by this specific API client (identified by the API client id).
     /// For client ID 0, this will bind previous manual TWS orders.
-    pub fn req_news_providers(&mut self) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_news_providers(&mut self) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_NEWS_PROVIDERS {
+        if self.server_version().await < MIN_SERVER_VER_REQ_NEWS_PROVIDERS {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -3888,7 +3949,7 @@ impl EClient
         let mut msg = "".to_string();
         msg.push_str(&make_field(&message_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -3901,16 +3962,16 @@ impl EClient
     /// * provider_code - short code indicating news provider, e.g. FLY
     /// * article_id - id of the specific article
     /// * news_article_options - reserved for internal use. Should be defined as null.
-    pub fn req_news_article(
+    pub async fn req_news_article(
         &mut self,
         req_id: i32,
         provider_code: &str,
         article_id: &str,
         news_article_options: Vec<TagValue>,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_NEWS_ARTICLE {
+        if self.server_version().await < MIN_SERVER_VER_REQ_NEWS_ARTICLE {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -3933,7 +3994,7 @@ impl EClient
         msg.push_str(&make_field(&String::from(article_id))?);
 
         // Send news_article_options parameter
-        if self.server_version() >= MIN_SERVER_VER_NEWS_QUERY_ORIGINS {
+        if self.server_version().await >= MIN_SERVER_VER_NEWS_QUERY_ORIGINS {
             let news_article_options_str = news_article_options
                 .iter()
                 .map(|x| format!("{}={};", x.tag, x.value))
@@ -3941,7 +4002,7 @@ impl EClient
             msg.push_str(&make_field(&news_article_options_str)?);
         }
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -3957,7 +4018,7 @@ impl EClient
     /// * end_date_time	- marks the (inclusive) end of the date range. The format is yyyy-MM-dd HH:mm:ss.0
     /// * total_results	- the maximum number of headlines to fetch (1 - 300)
     /// * historical_news_options	reserved for internal use. Should be defined as null.
-    pub fn req_historical_news(
+    pub async fn req_historical_news(
         &mut self,
         req_id: i32,
         con_id: i32,
@@ -3967,9 +4028,9 @@ impl EClient
         total_results: i32,
         historical_news_options: Vec<TagValue>,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_HISTORICAL_NEWS {
+        if self.server_version().await < MIN_SERVER_VER_REQ_HISTORICAL_NEWS {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -3995,7 +4056,7 @@ impl EClient
         msg.push_str(&make_field(&total_results)?);
 
         // Send historical_news_options parameter
-        if self.server_version() >= MIN_SERVER_VER_NEWS_QUERY_ORIGINS {
+        if self.server_version().await >= MIN_SERVER_VER_NEWS_QUERY_ORIGINS {
             let historical_news_options_str = historical_news_options
                 .iter()
                 .map(|x| format!("{}={};", x.tag, x.value))
@@ -4003,13 +4064,13 @@ impl EClient
             msg.push_str(&make_field(&historical_news_options_str)?);
         }
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //#########################################################################
-    //################## Display Groups
-    //#########################################################################
+//################## Display Groups
+//#########################################################################
     /// Replaces Financial Advisor's settings A Financial Advisor can define three different configurations:
     /// 1. Groups - offer traders a way to create a group of accounts and apply a single allocation method to all accounts in the group.
     /// 2. Profiles - let you allocate shares on an account-by-account basis using a predefined calculation value.
@@ -4018,10 +4079,10 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The unique number that will be associated with the response
-    pub fn query_display_groups(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn query_display_groups(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_LINKING {
+        if self.server_version().await < MIN_SERVER_VER_LINKING {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -4043,7 +4104,7 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -4053,14 +4114,14 @@ impl EClient
     /// # Arguments
     /// * req_id - The unique number that will be associated with the response
     /// * group_id - is the display group for integration
-    pub fn subscribe_to_group_events(
+    pub async fn subscribe_to_group_events(
         &mut self,
         req_id: i32,
         group_id: i32,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_LINKING {
+        if self.server_version().await < MIN_SERVER_VER_LINKING {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -4084,7 +4145,7 @@ impl EClient
         msg.push_str(&make_field(&req_id)?);
         msg.push_str(&make_field(&group_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -4098,14 +4159,14 @@ impl EClient
     /// 2. contract_id - any non-combination contract. Examples 8314 for IBM SMART; 8314 for IBM ARCA
     /// 3. combo - if any combo is selected Note: This request from the API does not get a TWS response unless an error occurs.
 
-    pub fn update_display_group(
+    pub async fn update_display_group(
         &mut self,
         req_id: i32,
         contract_info: &str,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_LINKING {
+        if self.server_version().await < MIN_SERVER_VER_LINKING {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -4129,7 +4190,7 @@ impl EClient
         msg.push_str(&make_field(&req_id)?);
         msg.push_str(&make_field(&String::from(contract_info))?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -4138,10 +4199,10 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - The request Id specified in subscribe_to_group_events()
-    pub fn unsubscribe_from_group_events(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn unsubscribe_from_group_events(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_LINKING {
+        if self.server_version().await < MIN_SERVER_VER_LINKING {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 req_id,
                 TwsError::UpdateTws.code().to_string(),
@@ -4164,20 +4225,20 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
     /// For IB's internal purpose. Allows to provide means of verification between the TWS and third party programs.
-    pub fn verify_request(
+    pub async fn verify_request(
         &mut self,
         api_name: &str,
         api_version: &str,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_LINKING {
+        if self.server_version().await < MIN_SERVER_VER_LINKING {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -4215,16 +4276,16 @@ impl EClient
         msg.push_str(&make_field(&String::from(api_name))?);
         msg.push_str(&make_field(&String::from(api_version))?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
     /// For IB's internal purpose. Allows to provide means of verification between the TWS and third party programs.
-    pub fn verify_message(&mut self, api_data: &'static str) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn verify_message(&mut self, api_data: &'static str) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_LINKING {
+        if self.server_version().await < MIN_SERVER_VER_LINKING {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -4247,21 +4308,21 @@ impl EClient
         msg.push_str(&make_field(&version)?);
         msg.push_str(&make_field(&api_data)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
     /// For IB's internal purpose. Allows to provide means of verification between the TWS and third party programs.
-    pub fn verify_and_auth_request(
+    pub async fn verify_and_auth_request(
         &mut self,
         api_name: &str,
         api_version: &str,
         opaque_isv_key: &str,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_LINKING {
+        if self.server_version().await < MIN_SERVER_VER_LINKING {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -4300,20 +4361,20 @@ impl EClient
         msg.push_str(&make_field(&String::from(api_version))?);
         msg.push_str(&make_field(&String::from(opaque_isv_key))?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
     /// For IB's internal purpose. Allows to provide means of verification between the TWS and third party programs
-    pub fn verify_and_auth_message(
+    pub async fn verify_and_auth_message(
         &mut self,
         api_data: &str,
         xyz_response: &str,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_LINKING {
+        if self.server_version().await < MIN_SERVER_VER_LINKING {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -4337,7 +4398,7 @@ impl EClient
         msg.push_str(&make_field(&String::from(api_data))?);
         msg.push_str(&make_field(&String::from(xyz_response))?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -4350,7 +4411,7 @@ impl EClient
     /// * fut_fop_exchange - The exchange on which the returned options are trading. Can be set to the empty string "" for all exchanges.
     /// * underlying_sec_type - The type of the underlying security, i.e. STK
     /// * underlying_con_id - the contract ID of the underlying security
-    pub fn req_sec_def_opt_params(
+    pub async fn req_sec_def_opt_params(
         &mut self,
         req_id: i32,
         underlying_symbol: &str,
@@ -4358,9 +4419,9 @@ impl EClient
         underlying_sec_type: &str,
         underlying_con_id: i32,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_SEC_DEF_OPT_PARAMS_REQ {
+        if self.server_version().await < MIN_SERVER_VER_SEC_DEF_OPT_PARAMS_REQ {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -4384,7 +4445,7 @@ impl EClient
         msg.push_str(&make_field(&String::from(underlying_sec_type))?);
         msg.push_str(&make_field(&underlying_con_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -4395,8 +4456,8 @@ impl EClient
     ///
     /// # Arguments
     /// * req_id - the identifier for this request
-    pub fn req_soft_dollar_tiers(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_soft_dollar_tiers(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let message_id: i32 = OutgoingMessageIds::ReqSoftDollarTiers as i32;
         let mut msg = "".to_string();
@@ -4404,16 +4465,16 @@ impl EClient
 
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
     /// Requests family codes for an account, for instance if it is a FA, IBroker, or associated account.
-    pub fn req_family_codes(&mut self) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_family_codes(&mut self) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_FAMILY_CODES {
+        if self.server_version().await < MIN_SERVER_VER_REQ_FAMILY_CODES {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -4431,7 +4492,7 @@ impl EClient
         let mut msg = "".to_string();
         msg.push_str(&make_field(&message_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -4441,14 +4502,14 @@ impl EClient
     /// # Arguments
     /// * req_id - the identifier for this request
     /// * pattern - either start of ticker symbol or (for larger strings) company name
-    pub fn req_matching_symbols(
+    pub async fn req_matching_symbols(
         &mut self,
         req_id: i32,
         pattern: &str,
     ) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version() < MIN_SERVER_VER_REQ_MATCHING_SYMBOLS {
+        if self.server_version().await < MIN_SERVER_VER_REQ_MATCHING_SYMBOLS {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -4469,7 +4530,7 @@ impl EClient
         msg.push_str(&make_field(&req_id)?);
         msg.push_str(&make_field(&String::from(pattern))?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
@@ -4479,8 +4540,8 @@ impl EClient
     /// # Arguments
     /// * api_only - If api_only parameter is true, then only completed orders placed from API are requested.
     ///              Each completed order will be fed back through the completed_order() function on the Wrapper
-    pub fn req_completed_orders(&mut self, api_only: bool) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_completed_orders(&mut self, api_only: bool) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
         let message_id: i32 = OutgoingMessageIds::ReqCompletedOrders as i32;
         let mut msg = "".to_string();
@@ -4488,14 +4549,14 @@ impl EClient
 
         msg.push_str(&make_field(&api_only)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
-    pub fn req_wsh_meta_data(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        self.check_connected(NO_VALID_ID)?;
+    pub async fn req_wsh_meta_data(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        self.check_connected(NO_VALID_ID).await?;
 
-        if self.server_version < MIN_SERVER_VER_WSHE_CALENDAR {
+        if self.server_version().await < MIN_SERVER_VER_WSHE_CALENDAR {
             let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                 NO_VALID_ID,
                 TwsError::UpdateTws.code().to_string(),
@@ -4516,15 +4577,15 @@ impl EClient
 
         msg.push_str(&make_field(&req_id)?);
 
-        self.send_request(msg.as_str())?;
+        self.send_request(msg.as_str()).await?;
         Ok(())
     }
 
 
     //------------------------------------------------------------------------------------------------
     /// check if client is connected to TWS
-    fn check_connected(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
-        match self.is_connected() {
+    async fn check_connected(&mut self, req_id: i32) -> Result<(), IBKRApiLibError> {
+        match self.is_connected().await {
             false => {
                 let err = IBKRApiLibError::ApiError(TwsApiReportableError::new(
                     req_id,

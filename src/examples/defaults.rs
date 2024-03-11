@@ -30,7 +30,7 @@ impl DefaultWrapper {
     }
 }
 impl Wrapper for DefaultWrapper {
-    fn error(&mut self, req_id: i32, error_code: i32, error_string: &str) {
+    fn error(& self, req_id: i32, error_code: i32, error_string: &str) {
         error!(
             "req_id: {} ,error_code: {} , error_string:{}",
             req_id, error_code, error_string
@@ -38,17 +38,17 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn win_error(&mut self, text: &str, last_error: i32) {
+    fn win_error(& self, text: &str, last_error: i32) {
         error!("text: {} , last_error:{}", text, last_error);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn connect_ack(&mut self) {
+    fn connect_ack(& self) {
         info!("Connected.");
     }
 
     //----------------------------------------------------------------------------------------------
-    fn market_data_type(&mut self, req_id: i32, market_data_type: i32) {
+    fn market_data_type(& self, req_id: i32, market_data_type: i32) {
         info!(
             "market_data_type -- req_id: {}, market_data_type: {}",
             req_id, market_data_type
@@ -56,7 +56,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn tick_price(&mut self, req_id: i32, tick_type: TickType, price: f64, attrib: TickAttrib) {
+    fn tick_price(& self, req_id: i32, tick_type: TickType, price: f64, attrib: TickAttrib) {
         info!(
             "tick_size -- req_id: {}, tick_type: {}, price: {}, attrib: {}",
             req_id, tick_type, price, attrib
@@ -64,7 +64,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn tick_size(&mut self, req_id: i32, tick_type: TickType, size: i32) {
+    fn tick_size(& self, req_id: i32, tick_type: TickType, size: i32) {
         info!(
             "tick_size -- req_id: {}, tick_type: {}, size: {}",
             req_id, tick_type, size
@@ -72,12 +72,12 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn tick_snapshot_end(&mut self, req_id: i32) {
+    fn tick_snapshot_end(& self, req_id: i32) {
         info!("tick_snapshot_end -- req_id: {}", req_id);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn tick_generic(&mut self, req_id: i32, tick_type: TickType, value: f64) {
+    fn tick_generic(& self, req_id: i32, tick_type: TickType, value: f64) {
         info!(
             "tick_generic -- req_id: {}, tick_type: {}, value: {}",
             req_id, tick_type, value
@@ -85,7 +85,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn tick_string(&mut self, req_id: i32, tick_type: TickType, value: &str) {
+    fn tick_string(& self, req_id: i32, tick_type: TickType, value: &str) {
         info!(
             "tick_string -- req_id: {}, tick_type: {}, value: {}",
             req_id, tick_type, value
@@ -94,7 +94,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn tick_efp(
-        &mut self,
+        & self,
         req_id: i32,
         tick_type: TickType,
         basis_points: f64,
@@ -129,7 +129,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn order_status(
-        &mut self,
+        & self,
         order_id: i32,
         status: &str,
         filled: f64,
@@ -152,7 +152,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn open_order(
-        &mut self,
+        & self,
         order_id: i32,
         contract: Contract,
         order: Order,
@@ -165,17 +165,17 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn open_order_end(&mut self) {
+    fn open_order_end(& self) {
         info!("open_order_end. (no parmeters passed)");
     }
 
     //----------------------------------------------------------------------------------------------
-    fn connection_closed(&mut self) {
+    fn connection_closed(& self) {
         info!("connection_closed. (no parmeters passed)");
     }
 
     //----------------------------------------------------------------------------------------------
-    fn update_account_value(&mut self, key: &str, val: &str, currency: &str, account_name: &str) {
+    fn update_account_value(& self, key: &str, val: &str, currency: &str, account_name: &str) {
         info!(
             "key: {}, value: {}, ccy: {}, account: {}.",
             key, val, currency, account_name
@@ -184,7 +184,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn update_portfolio(
-        &mut self,
+        & self,
         contract: Contract,
         position: f64,
         market_price: f64,
@@ -209,22 +209,22 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn update_account_time(&mut self, time_stamp: &str) {
+    fn update_account_time(& self, time_stamp: &str) {
         info!("update_account_time: {}.", time_stamp);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn account_download_end(&mut self, account_name: &str) {
+    fn account_download_end(& self, account_name: &str) {
         info!("account_download_end: {}.", account_name);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn next_valid_id(&mut self, order_id: i32) {
+    fn next_valid_id(& self, order_id: i32) {
         info!("next_valid_id -- order_id: {}", order_id);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn contract_details(&mut self, req_id: i32, contract_details: ContractDetails) {
+    fn contract_details(& self, req_id: i32, contract_details: ContractDetails) {
         info!(
             "contract_details -- req_id: {}, contract_details: {}",
             req_id, contract_details
@@ -232,7 +232,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn bond_contract_details(&mut self, req_id: i32, contract_details: ContractDetails) {
+    fn bond_contract_details(& self, req_id: i32, contract_details: ContractDetails) {
         info!(
             "bond_contract_details -- req_id: {}, contract_details: {}",
             req_id, contract_details
@@ -240,12 +240,12 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn contract_details_end(&mut self, req_id: i32) {
+    fn contract_details_end(& self, req_id: i32) {
         info!("contract_details_end -- req_id: {}", req_id);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn exec_details(&mut self, req_id: i32, contract: Contract, execution: Execution) {
+    fn exec_details(& self, req_id: i32, contract: Contract, execution: Execution) {
         info!(
             "exec_details -- req_id: {}, contract: {}, execution: {}",
             req_id, contract, execution
@@ -253,13 +253,13 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn exec_details_end(&mut self, req_id: i32) {
+    fn exec_details_end(& self, req_id: i32) {
         info!("exec_details_end -- req_id: {}", req_id);
     }
 
     //----------------------------------------------------------------------------------------------
     fn update_mkt_depth(
-        &mut self,
+        & self,
         req_id: i32,
         position: i32,
         operation: i32,
@@ -275,7 +275,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn update_mkt_depth_l2(
-        &mut self,
+        & self,
         req_id: i32,
         position: i32,
         market_maker: &str,
@@ -293,7 +293,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn update_news_bulletin(
-        &mut self,
+        & self,
         msg_id: i32,
         msg_type: i32,
         news_message: &str,
@@ -306,22 +306,22 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn managed_accounts(&mut self, accounts_list: &str) {
+    fn managed_accounts(& self, accounts_list: &str) {
         info!("managed_accounts -- accounts_list: {}", accounts_list);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn receive_fa(&mut self, fa_data: FaDataType, cxml: &str) {
+    fn receive_fa(& self, fa_data: FaDataType, cxml: &str) {
         info!("receive_fa -- fa_data: {}, cxml: {}", fa_data, cxml);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn historical_data(&mut self, req_id: i32, bar: BarData) {
-        info!("historical_data -- req_id: {}, bar: {}", req_id, bar);
+    fn historical_data(& self, req_id: i32, bars: Vec<BarData>, start: &str, end: &str) {
+        info!("historical_data -- req_id: {}, start {} end {} bar: {:?}", req_id, start, end, bars);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn historical_data_end(&mut self, req_id: i32, start: &str, end: &str) {
+    fn historical_data_end(& self, req_id: i32, start: &str, end: &str) {
         info!(
             "historical_data_end -- req_id: {}, start: {}, end: {}",
             req_id, start, end
@@ -329,13 +329,13 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn scanner_parameters(&mut self, xml: &str) {
+    fn scanner_parameters(& self, xml: &str) {
         info!("scanner_parameters -- xml: {}", xml);
     }
 
     //----------------------------------------------------------------------------------------------
     fn scanner_data(
-        &mut self,
+        & self,
         req_id: i32,
         rank: i32,
         contract_details: ContractDetails,
@@ -356,12 +356,12 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn scanner_data_end(&mut self, req_id: i32) {
+    fn scanner_data_end(& self, req_id: i32) {
         info!("scanner_data_end -- req_id: {}", req_id);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn realtime_bar(&mut self, req_id: i32, bar: RealTimeBar) {
+    fn realtime_bar(& self, req_id: i32, bar: RealTimeBar) {
         info!(
             "realtime_bar -- req_id: {}, date_time: {}, open: {}, high: {}, low: {}, close: {}, volume: {}, wap: {}, count: {}",
             req_id,
@@ -377,7 +377,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn current_time(&mut self, time: i64) {
+    fn current_time(& self, time: i64) {
         // Creates a new SystemTime from the specified number of whole seconds
         let d = UNIX_EPOCH + Duration::from_secs(time as u64);
         // Create DateTime from SystemTime
@@ -388,7 +388,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn fundamental_data(&mut self, req_id: i32, data: &str) {
+    fn fundamental_data(& self, req_id: i32, data: &str) {
         info!(
             "fundamental_data -- req_id: {}, delta_neutral_contract: {}",
             req_id, data
@@ -397,7 +397,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn delta_neutral_validation(
-        &mut self,
+        & self,
         req_id: i32,
         delta_neutral_contract: DeltaNeutralContract,
     ) {
@@ -408,7 +408,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn commission_report(&mut self, commission_report: CommissionReport) {
+    fn commission_report(& self, commission_report: CommissionReport) {
         info!(
             "commission_report -- commission_report: {}",
             commission_report
@@ -416,7 +416,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn position(&mut self, account: &str, contract: Contract, position: f64, avg_cost: f64) {
+    fn position(& self, account: &str, contract: Contract, position: f64, avg_cost: f64) {
         info!(
             "position -- account: {}, contract: [{}], position: {}, avg_cost: {}",
             account, contract, position, avg_cost
@@ -424,13 +424,13 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn position_end(&mut self) {
+    fn position_end(& self) {
         info!("position_end -- (no params are passed in this one)");
     }
 
     //----------------------------------------------------------------------------------------------
     fn account_summary(
-        &mut self,
+        & self,
         req_id: i32,
         account: &str,
         tag: &str,
@@ -444,17 +444,17 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn account_summary_end(&mut self, req_id: i32) {
+    fn account_summary_end(& self, req_id: i32) {
         info!("account_summary_end -- req_id: {}", req_id);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn verify_message_api(&mut self, api_data: &str) {
+    fn verify_message_api(& self, api_data: &str) {
         info!("verify_message_api -- api_data: {}", api_data);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn verify_completed(&mut self, is_successful: bool, error_text: &str) {
+    fn verify_completed(& self, is_successful: bool, error_text: &str) {
         info!(
             "verify_completed -- is_successful: {}, error_text: {}",
             is_successful, error_text
@@ -462,7 +462,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn verify_and_auth_message_api(&mut self, api_data: &str, xyz_challange: &str) {
+    fn verify_and_auth_message_api(& self, api_data: &str, xyz_challange: &str) {
         info!(
             "verify_and_auth_message_api -- api_data: {}, xyz_challange: {}",
             api_data, xyz_challange
@@ -470,7 +470,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn verify_and_auth_completed(&mut self, is_successful: bool, error_text: &str) {
+    fn verify_and_auth_completed(& self, is_successful: bool, error_text: &str) {
         info!(
             "verify_and_auth_completed -- is_successful: {}, error_text: {}",
             is_successful, error_text
@@ -478,7 +478,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn display_group_list(&mut self, req_id: i32, groups: &str) {
+    fn display_group_list(& self, req_id: i32, groups: &str) {
         info!(
             "display_group_list -- req_id: {}, error_text: {}",
             req_id, groups
@@ -486,7 +486,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn display_group_updated(&mut self, req_id: i32, contract_info: &str) {
+    fn display_group_updated(& self, req_id: i32, contract_info: &str) {
         info!(
             "display_group_updated -- req_id: {}, contract_info: {}",
             req_id, contract_info
@@ -495,7 +495,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn position_multi(
-        &mut self,
+        & self,
         req_id: i32,
         account: &str,
         model_code: &str,
@@ -511,13 +511,13 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn position_multi_end(&mut self, req_id: i32) {
+    fn position_multi_end(& self, req_id: i32) {
         info!("position_multi_end -- req_id: {}", req_id);
     }
 
     //----------------------------------------------------------------------------------------------
     fn account_update_multi(
-        &mut self,
+        & self,
         req_id: i32,
         account: &str,
         model_code: &str,
@@ -532,13 +532,13 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn account_update_multi_end(&mut self, req_id: i32) {
+    fn account_update_multi_end(& self, req_id: i32) {
         info!("account_update_multi_end -- req_id: {}", req_id);
     }
 
     //----------------------------------------------------------------------------------------------
     fn tick_option_computation(
-        &mut self,
+        & self,
         req_id: i32,
         tick_type: TickType,
         implied_vol: f64,
@@ -568,7 +568,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn security_definition_option_parameter(
-        &mut self,
+        & self,
         req_id: i32,
         exchange: &str,
         underlying_con_id: i32,
@@ -597,7 +597,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn security_definition_option_parameter_end(&mut self, req_id: i32) {
+    fn security_definition_option_parameter_end(& self, req_id: i32) {
         info!(
             "security_definition_option_parameter_end -- req_id: {}",
             req_id
@@ -605,7 +605,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn soft_dollar_tiers(&mut self, req_id: i32, tiers: Vec<SoftDollarTier>) {
+    fn soft_dollar_tiers(& self, req_id: i32, tiers: Vec<SoftDollarTier>) {
         info!(
             "soft_dollar_tiers -- req_id: {}, tiers: {:?}",
             req_id, tiers
@@ -613,12 +613,12 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn family_codes(&mut self, family_codes: Vec<FamilyCode>) {
+    fn family_codes(& self, family_codes: Vec<FamilyCode>) {
         info!("family_codes -- family_codes: {:?}", family_codes);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn symbol_samples(&mut self, req_id: i32, contract_descriptions: Vec<ContractDescription>) {
+    fn symbol_samples(& self, req_id: i32, contract_descriptions: Vec<ContractDescription>) {
         info!(
             "symbol_samples -- req_id: {}, contract_descriptions: {:?}",
             req_id, contract_descriptions
@@ -626,7 +626,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn mkt_depth_exchanges(&mut self, depth_mkt_data_descriptions: Vec<DepthMktDataDescription>) {
+    fn mkt_depth_exchanges(& self, depth_mkt_data_descriptions: Vec<DepthMktDataDescription>) {
         info!(
             "mkt_depth_exchanges -- depth_mkt_data_descriptions: {:?}",
             depth_mkt_data_descriptions
@@ -635,7 +635,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn tick_news(
-        &mut self,
+        & self,
         ticker_id: i32,
         time_stamp: i32,
         provider_code: &str,
@@ -651,7 +651,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn smart_components(&mut self, req_id: i32, smart_components: Vec<SmartComponent>) {
+    fn smart_components(& self, req_id: i32, smart_components: Vec<SmartComponent>) {
         info!(
             "smart_components -- req_id: {}, smart_components: {:?}",
             req_id, smart_components
@@ -660,7 +660,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn tick_req_params(
-        &mut self,
+        & self,
         ticker_id: i32,
         min_tick: f64,
         bbo_exchange: &str,
@@ -673,12 +673,12 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn news_providers(&mut self, news_providers: Vec<NewsProvider>) {
+    fn news_providers(& self, news_providers: Vec<NewsProvider>) {
         info!("news_providers -- news_providers: {:?}", news_providers);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn news_article(&mut self, request_id: i32, article_type: i32, article_text: &str) {
+    fn news_article(& self, request_id: i32, article_type: i32, article_text: &str) {
         info!(
             "news_article -- request_id: {}, article_type: {}, article_text: {}",
             request_id, article_type, article_text
@@ -687,7 +687,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn historical_news(
-        &mut self,
+        & self,
         request_id: i32,
         time: &str,
         provider_code: &str,
@@ -701,7 +701,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn historical_news_end(&mut self, request_id: i32, has_more: bool) {
+    fn historical_news_end(& self, request_id: i32, has_more: bool) {
         info!(
             "historical_news_end -- request_id: {}, has_more: {}",
             request_id, has_more
@@ -709,7 +709,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn head_timestamp(&mut self, req_id: i32, head_timestamp: &str) {
+    fn head_timestamp(& self, req_id: i32, head_timestamp: &str) {
         info!(
             "head_timestamp -- req_id: {}, head_timestamp: {}",
             req_id, head_timestamp
@@ -717,17 +717,17 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn histogram_data(&mut self, req_id: i32, items: Vec<HistogramData>) {
+    fn histogram_data(& self, req_id: i32, items: Vec<HistogramData>) {
         info!("histogram_data -- req_id: {}, items: {:?}", req_id, items);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn historical_data_update(&mut self, req_id: i32, bar: BarData) {
+    fn historical_data_update(& self, req_id: i32, bar: BarData) {
         info!("historical_data_update -- req_id: {}, bar: {}", req_id, bar);
     }
 
     //----------------------------------------------------------------------------------------------
-    fn reroute_mkt_data_req(&mut self, req_id: i32, con_id: i32, exchange: &str) {
+    fn reroute_mkt_data_req(& self, req_id: i32, con_id: i32, exchange: &str) {
         info!(
             "reroute_mkt_data_req -- req_id: {}, con_id: {}, exchange: {}",
             req_id, con_id, exchange
@@ -735,7 +735,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn reroute_mkt_depth_req(&mut self, req_id: i32, con_id: i32, exchange: &str) {
+    fn reroute_mkt_depth_req(& self, req_id: i32, con_id: i32, exchange: &str) {
         info!(
             "reroute_mkt_depth_req -- req_id: {}, con_id: {}, exchange: {}",
             req_id, con_id, exchange
@@ -743,7 +743,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn market_rule(&mut self, market_rule_id: i32, price_increments: Vec<PriceIncrement>) {
+    fn market_rule(& self, market_rule_id: i32, price_increments: Vec<PriceIncrement>) {
         info!(
             "market_rule -- market_rule_id: {}, price_increments: {:?}",
             market_rule_id, price_increments
@@ -751,7 +751,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn pnl(&mut self, req_id: i32, daily_pn_l: f64, unrealized_pn_l: f64, realized_pn_l: f64) {
+    fn pnl(& self, req_id: i32, daily_pn_l: f64, unrealized_pn_l: f64, realized_pn_l: f64) {
         info!(
             "pnl -- req_id: {}, daily_pn_l: {}, unrealized_pn_l: {}, realized_pn_l: {})",
             req_id, daily_pn_l, unrealized_pn_l, realized_pn_l
@@ -760,7 +760,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn pnl_single(
-        &mut self,
+        & self,
         req_id: i32,
         pos: i32,
         daily_pn_l: f64,
@@ -775,7 +775,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn historical_ticks(&mut self, req_id: i32, ticks: Vec<HistoricalTick>, done: bool) {
+    fn historical_ticks(& self, req_id: i32, ticks: Vec<HistoricalTick>, done: bool) {
         info!(
             "historical_ticks -- req_id: {}, ticks: {:?}, done: {}",
             req_id, ticks, done
@@ -784,7 +784,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn historical_ticks_bid_ask(
-        &mut self,
+        & self,
         req_id: i32,
         ticks: Vec<HistoricalTickBidAsk>,
         done: bool,
@@ -796,7 +796,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn historical_ticks_last(&mut self, req_id: i32, ticks: Vec<HistoricalTickLast>, done: bool) {
+    fn historical_ticks_last(& self, req_id: i32, ticks: Vec<HistoricalTickLast>, done: bool) {
         info!(
             "historical_ticks_last -- req_id: {}, ticks: {:?}, done: {}",
             req_id, ticks, done
@@ -805,7 +805,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn tick_by_tick_all_last(
-        &mut self,
+        & self,
         req_id: i32,
         tick_type: TickByTickType,
         time: i64,
@@ -824,7 +824,7 @@ impl Wrapper for DefaultWrapper {
 
     //----------------------------------------------------------------------------------------------
     fn tick_by_tick_bid_ask(
-        &mut self,
+        & self,
         req_id: i32,
         time: i64,
         bid_price: f64,
@@ -841,7 +841,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn tick_by_tick_mid_point(&mut self, req_id: i32, time: i64, mid_point: f64) {
+    fn tick_by_tick_mid_point(& self, req_id: i32, time: i64, mid_point: f64) {
         info!(
             "tick_by_tick_mid_point -- req_id: {}, time: {}, mid_point: {}",
             req_id, time, mid_point
@@ -849,7 +849,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn order_bound(&mut self, req_id: i32, api_client_id: i32, api_order_id: i32) {
+    fn order_bound(& self, req_id: i32, api_client_id: i32, api_order_id: i32) {
         info!(
             "order_bound -- req_id: {}, api_client_id: {}, api_order_id: {}",
             req_id, api_client_id, api_order_id
@@ -857,7 +857,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn completed_order(&mut self, contract: Contract, order: Order, order_state: OrderState) {
+    fn completed_order(& self, contract: Contract, order: Order, order_state: OrderState) {
         info!(
             "completed_order -- contract: [{}], order: [{}], order_state: [{}]",
             contract, order, order_state
@@ -865,11 +865,11 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn completed_orders_end(&mut self) {
+    fn completed_orders_end(& self) {
         info!("completed_orders_end -- (no parameters for this message)");
     }
 
-    fn wsh_meta_data(&mut self, req_id: i32, data_json: &str) {
+    fn wsh_meta_data(& self, req_id: i32, data_json: &str) {
         info!("wsh_meta_data req_id: {} data: {}", req_id, data_json);
     }
 }

@@ -11,14 +11,43 @@ use ascii::AsAsciiStr;
 
 use log::*;
 use num_derive::FromPrimitive;
+use tokio::sync::oneshot;
 
 use crate::core::common::{UNSET_DOUBLE, UNSET_INTEGER};
 use crate::core::errors::IBKRApiLibError;
 
 //==================================================================================================
-trait EClientMsgSink {
-    fn server_version(version: i32, time: &str);
-    fn redirect(host: &str);
+#[derive(Debug)]
+pub struct EClientMsgSink {
+    pub version: i32,
+    pub time: String,
+    tx: Option<oneshot::Sender<(i32, String)>>
+    // fn redirect(host: &str);
+}
+
+impl EClientMsgSink {
+
+    pub fn new() -> Self {
+        EClientMsgSink {
+            version: 0,
+            time: String::new(),
+            tx: None
+        }
+    }
+
+    pub async fn server_version(&mut self, version: i32, time: &str){
+        // self.version = version;
+        self.version = 178;
+        self.time = time.to_string();
+        if let Some(tx) = self.tx.take() {
+            tx.send((version, time.to_string())).unwrap()
+        }
+
+    }
+
+    pub async fn set_sender(&mut self, tx: oneshot::Sender<(i32, String)>) {
+        self.tx = Some(tx);
+    }
 }
 
 //==================================================================================================
@@ -241,6 +270,16 @@ pub fn read_msg<'a>(buf: &[u8]) -> Result<(usize, String, Vec<u8>), IBKRApiLibEr
     } else {
         Ok((size, String::new(), buf.to_vec()))
     }
+}
+
+pub async fn read_one_msg<'a>(buf: &[u8]) -> Result<String, IBKRApiLibError> {
+
+    String::from_utf8(buf.to_vec())
+        .map_err(|e|
+            IBKRApiLibError::General("error converting message bytes to utf8".to_string())
+        )
+    //debug!("read_msg: text in read message: {:?}", text);
+
 }
 
 //==================================================================================================
