@@ -18,6 +18,7 @@ use crate::core::contract::{Contract, ContractDescription, ContractDetails, Delt
 use crate::core::execution::Execution;
 use crate::core::order::{Order, OrderState, SoftDollarTier};
 use crate::core::wrapper::Wrapper;
+use async_trait::async_trait;
 
 //==================================================================================================
 /// Example implementation of the Wrapper callback trait.  Just logs callback methods
@@ -29,8 +30,10 @@ impl DefaultWrapper {
         DefaultWrapper {}
     }
 }
+
+#[async_trait]
 impl Wrapper for DefaultWrapper {
-    fn error(& self, req_id: i32, error_code: i32, error_string: &str) {
+    async fn error(& self, req_id: i32, error_code: i32, error_string: &str) {
         error!(
             "req_id: {} ,error_code: {} , error_string:{}",
             req_id, error_code, error_string
@@ -316,7 +319,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn historical_data(& self, req_id: i32, bars: Vec<BarData>, start: &str, end: &str) {
+    async fn historical_data(& self, req_id: i32, bars: Vec<BarData>, start: &str, end: &str) {
         info!("historical_data -- req_id: {}, start {} end {} bar: {:?}", req_id, start, end, bars);
     }
 
@@ -388,7 +391,7 @@ impl Wrapper for DefaultWrapper {
     }
 
     //----------------------------------------------------------------------------------------------
-    fn fundamental_data(& self, req_id: i32, data: &str) {
+    async fn fundamental_data(& self, req_id: i32, data: & str) {
         info!(
             "fundamental_data -- req_id: {}, delta_neutral_contract: {}",
             req_id, data

@@ -7,7 +7,7 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::channel;
 use std::sync::Arc;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, oneshot, RwLock};
 use tokio::task;
 use std::{fmt::Debug, thread};
 
@@ -49,7 +49,7 @@ pub enum ConnStatus {
 //==================================================================================================
 /// Struct for sending requests
 #[derive(Debug)]
-pub struct EClient
+pub struct EClient // <T: Wrapper>
 {
     wrapper: Arc<dyn Wrapper>,
     // pub(crate) stream: Option<OwneWriteHalf>,
@@ -60,7 +60,7 @@ pub struct EClient
     client_id: i32,
     // pub(crate) server_version: i32,
     msg_sink: Arc<Mutex<EClientMsgSink>>,
-    pub conn_state: Arc<Mutex<ConnStatus>>,
+    pub conn_state: Arc<RwLock<ConnStatus>>,
     opt_capab: String,
     disconnect_requested: Arc<AtomicBool>,
 }
@@ -76,7 +76,7 @@ impl EClient
             extra_auth: false,
             client_id: 0,
             msg_sink: Arc::new(Mutex::new(EClientMsgSink::new())),
-            conn_state: Arc::new(Mutex::new(ConnStatus::DISCONNECTED)),
+            conn_state: Arc::new(RwLock::new(ConnStatus::DISCONNECTED)),
             opt_capab: "".to_string(),
             disconnect_requested: Arc::new(AtomicBool::new(false)),
         }
@@ -127,7 +127,7 @@ impl EClient
         self.disconnect_requested.store(false, Ordering::Release);
 
         {
-            let mut conn_state = self.conn_state.lock().await;
+            let mut conn_state = self.conn_state.write().await;
             *conn_state = ConnStatus::CONNECTING;
         }
 
@@ -146,13 +146,12 @@ impl EClient
 
                 let mut decoder = Decoder::new(
                     self.wrapper.clone(),
-                    rx,
-                    0_i32,
+                    // rx,
                     self.conn_state.clone(),
                     Arc::clone(&self.msg_sink)
                 );
 
-                task::spawn(async move { decoder.run().await });
+                task::spawn(async move { decoder.run(rx).await });
 
                 let (tx1, rx1) = oneshot::channel();
 
@@ -172,7 +171,7 @@ impl EClient
                 }
 
                 {
-                    let mut conn_state = self.conn_state.lock().await;
+                    let mut conn_state = self.conn_state.write().await;
                     *conn_state = ConnStatus::CONNECTED;
                 }
 
@@ -239,7 +238,7 @@ impl EClient
     pub async fn is_connected(&self) -> bool {
         let status: ConnStatus;
         {
-            let conn_state = self.conn_state.lock().await;
+            let conn_state = self.conn_state.read().await;
             status = *conn_state;
         }
 
@@ -321,7 +320,7 @@ impl EClient
         }
 
         {
-            let mut conn_state = self.conn_state.lock().await;
+            let mut conn_state = self.conn_state.write().await;
             *conn_state = ConnStatus::DISCONNECTED;
         }
         Ok(())

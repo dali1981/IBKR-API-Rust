@@ -2,6 +2,7 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::marker::{Send, Sync};
+use async_trait::async_trait;
 
 use bigdecimal::BigDecimal;
 
@@ -16,11 +17,12 @@ use crate::core::execution::Execution;
 use crate::core::order::{Order, OrderState, SoftDollarTier};
 
 /// A trait that clients will implement that declares callback functions that get called when the application receives messages from the Trader WorkStation or IB Gateway
-pub trait Wrapper: Send + Sync + Debug {
+#[async_trait]
+pub trait Wrapper: Send + Sync + Debug + 'static {
     //----------------------------------------------------------------------------------------------
     /// This event is called when there is an error with the
     /// communication or when TWS wants to send a message to the core.
-    fn error(& self, req_id: i32, error_code: i32, error_string: &str);
+    async fn error(& self, req_id: i32, error_code: i32, error_string: &str);
 
     //----------------------------------------------------------------------------------------------
     fn win_error(& self, text: &str, last_error: i32);
@@ -308,7 +310,7 @@ pub trait Wrapper: Send + Sync + Debug {
     /// # Arguments
     /// * req_id - the request's identifier
     /// * bar - BarData struct containing historical bar data information
-    fn historical_data(& self, req_id: i32, bar: Vec<BarData>, start: &str, end: &str);
+    async fn historical_data(& self, req_id: i32, bar: Vec<BarData>, start: &str, end: &str);
 
     //----------------------------------------------------------------------------------------------
     /// Marks the ending of the historical bars reception.
@@ -364,7 +366,7 @@ pub trait Wrapper: Send + Sync + Debug {
     /// This function is called to receive fundamental
     /// market data. The appropriate market data subscription must be set
     /// up in Account Management before you can receive this data.
-    fn fundamental_data(& self, req_id: i32, data: &str);
+    async fn fundamental_data(& self, req_id: i32, data: & str);
 
     //----------------------------------------------------------------------------------------------
     /// Upon accepting a Delta-Neutral RFQ(request for quote), the

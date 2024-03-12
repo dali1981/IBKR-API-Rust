@@ -8,8 +8,9 @@ use std::str::FromStr;
 use std::string::ToString;
 use tokio::sync::mpsc::Receiver;
 use std::sync::Arc;
-use std::thread::spawn;
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
+use tokio::spawn;
+use tokio::sync::{Mutex, RwLock};
 
 use bigdecimal::{self, BigDecimal, Zero};
 
@@ -112,32 +113,34 @@ pub fn decode_dec(iter: &mut Iter<String>) -> Result<BigDecimal, IBKRApiLibError
 }
 
 pub struct Decoder {
-    msg_queue: Receiver<String>,
+    // msg_queue: Receiver<String>,
     pub wrapper: Arc<dyn Wrapper>,
-    pub server_version: i32,
-    conn_state: Arc<Mutex<ConnStatus>>,
-    client_msg_sink: Arc<Mutex<EClientMsgSink>>
+    pub server_version: AtomicI32,
+    // pub server_version: i32,
+    conn_state: Arc<RwLock<ConnStatus>>,
+    client_msg_sink: Arc<Mutex<EClientMsgSink>>,
 }
 
 impl Decoder
 {
     pub fn new(
         the_wrapper: Arc<dyn Wrapper>,
-        msg_queue: Receiver<String>,
-        server_version: i32,
-        conn_state: Arc<Mutex<ConnStatus>>,
+        // msg_queue: Receiver<String>,
+        conn_state: Arc<RwLock<ConnStatus>>,
         client_msg_sink: Arc<Mutex<EClientMsgSink>>
-    ) -> Self {
-        Decoder {
+    ) -> Arc<Self> {
+        let decoder = Decoder {
             wrapper: the_wrapper,
-            msg_queue,
-            server_version,
+            // msg_queue,
+            server_version: AtomicI32::new(0),
+            // server_version: 0,
             conn_state,
-            client_msg_sink
-        }
+            client_msg_sink,
+        };
+        Arc::new(decoder)
     }
 
-    async fn process_connect_ack(&mut self, fields: &[String]) -> Result<(), IBKRApiLibError> {
+    async fn process_connect_ack(self: Arc<Self>, fields: Vec<String>) -> Result<(), IBKRApiLibError> {
         let mut fields_itr = fields.iter();
         let version: i32 = decode_i32(&mut fields_itr)?;
         let connection_time:String = decode_string(&mut fields_itr)?;
@@ -146,25 +149,31 @@ impl Decoder
             client_msg_sink.server_version(version, connection_time.as_str()).await;
         }
         self.wrapper.connect_ack();
-        self.server_version = version;
+        {
+            self.server_version.store(version, Ordering::SeqCst);
+        }
 
         Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
-    pub async fn interpret(&mut self, fields: &[String]) -> Result<(), IBKRApiLibError> {
+    pub async fn interpret(self: Arc<Self>, fields: Vec<String>) -> Result<(), IBKRApiLibError> {
         if fields.is_empty() {
             return Ok(());
         }
 
         let msg_id = i32::from_str(fields.get(0).unwrap().as_str())?;
 
-        if self.server_version == 0 {
+        let server_version = self.server_version.load(Ordering::SeqCst);
+
+        if server_version == 0 {
             return self.process_connect_ack(fields).await;
         }
 
+        let cloned_self = Arc::clone(&self);
+
         match FromPrimitive::from_i32(msg_id) {
-            Some(IncomingMessageIds::TickPrice) => self.process_tick_price(fields)?,
+            // Some(IncomingMessageIds::TickPrice) => self.process_tick_price(fields)?,
             // Some(IncomingMessageIds::AccountSummary) => self.process_account_summary(fields)?,
             // Some(IncomingMessageIds::AccountSummaryEnd) => self.process_account_summary_end(fields)?,
             // Some(IncomingMessageIds::AccountUpdateMulti) => self.process_account_update_multi(fields)?,
@@ -198,19 +207,19 @@ impl Decoder
             // Some(IncomingMessageIds::DisplayGroupUpdated) => {
             //     self.process_display_group_updated(fields)?
             // }
-            Some(IncomingMessageIds::ErrMsg) => self.process_error_message(fields)?,
+            Some(IncomingMessageIds::ErrMsg) => { spawn(cloned_self.process_error_message(fields)); },
             // Some(IncomingMessageIds::ExecutionData) => self.process_execution_data(fields)?,
             // Some(IncomingMessageIds::ExecutionDataEnd) => {
             //     self.process_execution_data_end(fields)?
             // }
             // Some(IncomingMessageIds::FamilyCodes) => self.process_family_codes(fields)?,
-            Some(IncomingMessageIds::FundamentalData) => self.process_fundamental_data(fields).await?,
+            Some(IncomingMessageIds::FundamentalData) => { spawn(cloned_self.process_fundamental_data(fields));},
             // Some(IncomingMessageIds::HeadTimestamp) => self.process_head_timestamp(fields)?,
             // Some(IncomingMessageIds::HistogramData) => self.process_histogram_data(fields)?,
-            Some(IncomingMessageIds::HistoricalData) => self.process_historical_data(fields)?,
-            Some(IncomingMessageIds::HistoricalDataUpdate) => {
-                self.process_historical_data_update(fields)?
-            }
+            Some(IncomingMessageIds::HistoricalData) => { spawn(cloned_self.process_historical_data(fields)); },
+            // Some(IncomingMessageIds::HistoricalDataUpdate) => {
+            //     spawn(self.process_historical_data_update(fields));
+            // }
             // Some(IncomingMessageIds::HistoricalNews) => self.process_historical_news(fields)?,
             // Some(IncomingMessageIds::HistoricalNewsEnd) => {
             //     self.process_historical_news_end(fields)?
@@ -223,7 +232,7 @@ impl Decoder
             // Some(IncomingMessageIds::HistoricalTicksLast) => {
             //     self.process_historical_ticks_last(fields)?
             // }
-            Some(IncomingMessageIds::ManagedAccts) => self.process_managed_accounts(fields)?,
+            Some(IncomingMessageIds::ManagedAccts) => { self.process_managed_accounts(fields)?; },
             // Some(IncomingMessageIds::MarketDataType) => self.process_market_data_type(fields)?,
             // Some(IncomingMessageIds::MarketDepth) => self.process_market_depth(fields)?,
             // Some(IncomingMessageIds::MarketDepthL2) => self.process_market_depth_l2(fields)?,
@@ -234,7 +243,7 @@ impl Decoder
             // Some(IncomingMessageIds::NewsArticle) => self.process_news_article(fields)?,
             // Some(IncomingMessageIds::NewsBulletins) => self.process_news_bulletins(fields)?,
             // Some(IncomingMessageIds::NewsProviders) => self.process_news_providers(fields)?,
-            Some(IncomingMessageIds::NextValidId) => self.process_next_valid_id(fields)?,
+            Some(IncomingMessageIds::NextValidId) =>  { self.process_next_valid_id(fields)?; },
             // Some(IncomingMessageIds::OpenOrder) => self.process_open_order(fields)?,
             // Some(IncomingMessageIds::OpenOrderEnd) => self.process_open_order_end(fields)?,
             // Some(IncomingMessageIds::OrderStatus) => self.process_order_status(fields)?,
@@ -307,55 +316,55 @@ impl Decoder
     }
 
     //----------------------------------------------------------------------------------------------
-    fn process_tick_price(& self, fields: &[String]) -> Result<(), IBKRApiLibError> {
-        let mut fields_itr = fields.iter();
-
-        //throw away message_id
-        fields_itr.next();
-        //throw away version
-        fields_itr.next();
-
-        let req_id = decode_i32(&mut fields_itr)?;
-        let tick_type: i32 = decode_i32(&mut fields_itr)?;
-        let price: f64 = decode_f64(&mut fields_itr)?;
-        let size = decode_i32(&mut fields_itr)?;
-        let attr_mask: i32 = decode_i32(&mut fields_itr)?;
-        let mut tick_arrtibute = TickAttrib::new(false, false, false);
-
-        tick_arrtibute.can_auto_execute = attr_mask == 1;
-
-        if self.server_version >= MIN_SERVER_VER_PAST_LIMIT {
-            tick_arrtibute.can_auto_execute = attr_mask & 1 != 0;
-            tick_arrtibute.past_limit = attr_mask & 2 != 0;
-        }
-        if self.server_version >= MIN_SERVER_VER_PRE_OPEN_BID_ASK {
-            tick_arrtibute.pre_open = attr_mask & 4 != 0;
-        }
-        self.wrapper
-            .tick_price(
-                req_id,
-                FromPrimitive::from_i32(tick_type).unwrap(),
-                price,
-                tick_arrtibute,
-            );
-
-        // process ver 2 fields
-
-        let size_tick_type = match FromPrimitive::from_i32(tick_type) {
-            Some(TickType::Bid) => TickType::BidSize,
-            Some(TickType::Ask) => TickType::AskSize,
-            Some(TickType::Last) => TickType::LastSize,
-            Some(TickType::DelayedBid) => TickType::DelayedBidSize,
-            Some(TickType::DelayedAsk) => TickType::DelayedAskSize,
-            Some(TickType::DelayedLast) => TickType::DelayedLastSize,
-            _ => TickType::NotSet,
-        };
-
-        if size_tick_type as i32 != TickType::NotSet as i32 {
-            self.wrapper.tick_size(req_id, size_tick_type, size);
-        }
-        Ok(())
-    }
+    // async fn process_tick_price(& self, fields: &[String]) -> Result<(), IBKRApiLibError> {
+    //     let mut fields_itr = fields.iter();
+    //
+    //     //throw away message_id
+    //     fields_itr.next();
+    //     //throw away version
+    //     fields_itr.next();
+    //
+    //     let req_id = decode_i32(&mut fields_itr)?;
+    //     let tick_type: i32 = decode_i32(&mut fields_itr)?;
+    //     let price: f64 = decode_f64(&mut fields_itr)?;
+    //     let size = decode_i32(&mut fields_itr)?;
+    //     let attr_mask: i32 = decode_i32(&mut fields_itr)?;
+    //     let mut tick_arrtibute = TickAttrib::new(false, false, false);
+    //
+    //     tick_arrtibute.can_auto_execute = attr_mask == 1;
+    //
+    //     if self.server_version >= MIN_SERVER_VER_PAST_LIMIT {
+    //         tick_arrtibute.can_auto_execute = attr_mask & 1 != 0;
+    //         tick_arrtibute.past_limit = attr_mask & 2 != 0;
+    //     }
+    //     if self.server_version >= MIN_SERVER_VER_PRE_OPEN_BID_ASK {
+    //         tick_arrtibute.pre_open = attr_mask & 4 != 0;
+    //     }
+    //     self.wrapper
+    //         .tick_price(
+    //             req_id,
+    //             FromPrimitive::from_i32(tick_type).unwrap(),
+    //             price,
+    //             tick_arrtibute,
+    //         );
+    //
+    //     // process ver 2 fields
+    //
+    //     let size_tick_type = match FromPrimitive::from_i32(tick_type) {
+    //         Some(TickType::Bid) => TickType::BidSize,
+    //         Some(TickType::Ask) => TickType::AskSize,
+    //         Some(TickType::Last) => TickType::LastSize,
+    //         Some(TickType::DelayedBid) => TickType::DelayedBidSize,
+    //         Some(TickType::DelayedAsk) => TickType::DelayedAskSize,
+    //         Some(TickType::DelayedLast) => TickType::DelayedLastSize,
+    //         _ => TickType::NotSet,
+    //     };
+    //
+    //     if size_tick_type as i32 != TickType::NotSet as i32 {
+    //         self.wrapper.tick_size(req_id, size_tick_type, size);
+    //     }
+    //     Ok(())
+    // }
 
     //----------------------------------------------------------------------------------------------
     fn process_tick_string(&mut self, fields: &[String]) -> Result<(), IBKRApiLibError> {
@@ -508,7 +517,9 @@ impl Decoder
     }
 
     //----------------------------------------------------------------------------------------------
-    fn process_bond_contract_data(&mut self, fields: &[String]) -> Result<(), IBKRApiLibError> {
+    async fn process_bond_contract_data(&mut self, fields: &[String]) -> Result<(), IBKRApiLibError> {
+        let server_version = self.server_version.load(Ordering::SeqCst);
+
         let mut fields_itr = fields.iter();
 
         //throw away message_id
@@ -542,7 +553,7 @@ impl Decoder
         contract.contract.trading_class = decode_string(&mut fields_itr)?;
         contract.contract.con_id = decode_i32(&mut fields_itr)?;
         contract.min_tick = decode_f64(&mut fields_itr)?;
-        if self.server_version >= MIN_SERVER_VER_MD_SIZE_MULTIPLIER {
+        if server_version >= MIN_SERVER_VER_MD_SIZE_MULTIPLIER {
             contract.md_size_multiplier = decode_i32(&mut fields_itr)?;
         }
         contract.order_types = decode_string(&mut fields_itr)?;
@@ -572,15 +583,15 @@ impl Decoder
                 }
             }
         }
-        if self.server_version >= MIN_SERVER_VER_AGG_GROUP {
-            contract.agg_group = decode_i32(&mut fields_itr)?;
-        }
-        if self.server_version >= MIN_SERVER_VER_MARKET_RULES {
-            contract.market_rule_ids = decode_string(&mut fields_itr)?;
-        }
-
-        self.wrapper
-            .bond_contract_details(req_id, contract.clone());
+        // if self.server_version >= MIN_SERVER_VER_AGG_GROUP {
+        //     contract.agg_group = decode_i32(&mut fields_itr)?;
+        // }
+        // if self.server_version >= MIN_SERVER_VER_MARKET_RULES {
+        //     contract.market_rule_ids = decode_string(&mut fields_itr)?;
+        // }
+        //
+        // self.wrapper
+        //     .bond_contract_details(req_id, contract.clone());
         Ok(())
     }
 
@@ -619,18 +630,18 @@ impl Decoder
         let mut order = Order::default();
         let mut order_state = OrderState::default();
 
-        let mut order_decoder = OrderDecoder::new(
-            &mut contract,
-            &mut order,
-            &mut order_state,
-            UNSET_INTEGER,
-            self.server_version,
-        );
-
-        order_decoder.decode_completed(&mut fields_itr)?;
-
-        self.wrapper
-            .completed_order(contract, order, order_state);
+        // let mut order_decoder = OrderDecoder::new(
+        //     &mut contract,
+        //     &mut order,
+        //     &mut order_state,
+        //     UNSET_INTEGER,
+        //     self.server_version,
+        // );
+        //
+        // order_decoder.decode_completed(&mut fields_itr)?;
+        //
+        // self.wrapper
+        //     .completed_order(contract, order, order_state);
         Ok(())
     }
 
@@ -661,77 +672,77 @@ impl Decoder
 
         let mut contract = ContractDetails::default();
 
-        contract.contract.symbol = decode_string(&mut fields_itr)?;
-        contract.contract.sec_type = decode_string(&mut fields_itr)?;
-        self.read_last_trade_date(&mut contract, false, fields_itr.next().unwrap())?;
-        contract.contract.strike = decode_f64(&mut fields_itr)?;
-        contract.contract.right = decode_string(&mut fields_itr)?;
-        contract.contract.exchange = decode_string(&mut fields_itr)?;
-        contract.contract.currency = decode_string(&mut fields_itr)?;
-        contract.contract.local_symbol = decode_string(&mut fields_itr)?;
-        contract.market_name = decode_string(&mut fields_itr)?;
-        contract.contract.trading_class = decode_string(&mut fields_itr)?;
-        contract.contract.con_id = decode_i32(&mut fields_itr)?;
-        contract.min_tick = decode_f64(&mut fields_itr)?;
-        if self.server_version >= MIN_SERVER_VER_MD_SIZE_MULTIPLIER {
-            contract.md_size_multiplier = decode_i32(&mut fields_itr)?;
-        }
-        contract.contract.multiplier = decode_string(&mut fields_itr)?;
-        contract.order_types = decode_string(&mut fields_itr)?;
-        contract.valid_exchanges = decode_string(&mut fields_itr)?;
-        contract.price_magnifier = decode_i32(&mut fields_itr)?;
-        if version >= 4 {
-            contract.under_con_id = decode_i32(&mut fields_itr)?;
-        }
-        if version >= 5 {
-            contract.long_name = decode_string(&mut fields_itr)?;
-            contract.contract.primary_exchange = decode_string(&mut fields_itr)?;
-        }
-
-        if version >= 6 {
-            contract.contract_month = decode_string(&mut fields_itr)?;
-            contract.industry = decode_string(&mut fields_itr)?;
-            contract.category = decode_string(&mut fields_itr)?;
-            contract.subcategory = decode_string(&mut fields_itr)?;
-            contract.time_zone_id = decode_string(&mut fields_itr)?;
-            contract.trading_hours = decode_string(&mut fields_itr)?;
-            contract.liquid_hours = decode_string(&mut fields_itr)?;
-        }
-        if version >= 8 {
-            contract.ev_rule = decode_string(&mut fields_itr)?;
-            contract.ev_multiplier = decode_f64(&mut fields_itr)?;
-        }
-
-        if version >= 7 {
-            let sec_id_list_count = decode_i32(&mut fields_itr)?;
-            if sec_id_list_count > 0 {
-                contract.sec_id_list = vec![];
-                for _ in 0..sec_id_list_count {
-                    contract.sec_id_list.push(TagValue::new(
-                        decode_string(&mut fields_itr)?,
-                        decode_string(&mut fields_itr)?,
-                    ));
-                }
-            }
-        }
-        if self.server_version >= MIN_SERVER_VER_AGG_GROUP {
-            contract.agg_group = decode_i32(&mut fields_itr)?;
-        }
-
-        if self.server_version >= MIN_SERVER_VER_UNDERLYING_INFO {
-            contract.under_symbol = decode_string(&mut fields_itr)?;
-            contract.under_sec_type = decode_string(&mut fields_itr)?;
-        }
-        if self.server_version >= MIN_SERVER_VER_MARKET_RULES {
-            contract.market_rule_ids = decode_string(&mut fields_itr)?;
-        }
-
-        if self.server_version >= MIN_SERVER_VER_REAL_EXPIRATION_DATE {
-            contract.real_expiration_date = decode_string(&mut fields_itr)?;
-        }
-
-        self.wrapper
-            .contract_details(req_id, contract.clone());
+        // contract.contract.symbol = decode_string(&mut fields_itr)?;
+        // contract.contract.sec_type = decode_string(&mut fields_itr)?;
+        // self.read_last_trade_date(&mut contract, false, fields_itr.next().unwrap())?;
+        // contract.contract.strike = decode_f64(&mut fields_itr)?;
+        // contract.contract.right = decode_string(&mut fields_itr)?;
+        // contract.contract.exchange = decode_string(&mut fields_itr)?;
+        // contract.contract.currency = decode_string(&mut fields_itr)?;
+        // contract.contract.local_symbol = decode_string(&mut fields_itr)?;
+        // contract.market_name = decode_string(&mut fields_itr)?;
+        // contract.contract.trading_class = decode_string(&mut fields_itr)?;
+        // contract.contract.con_id = decode_i32(&mut fields_itr)?;
+        // contract.min_tick = decode_f64(&mut fields_itr)?;
+        // if self.server_version >= MIN_SERVER_VER_MD_SIZE_MULTIPLIER {
+        //     contract.md_size_multiplier = decode_i32(&mut fields_itr)?;
+        // }
+        // contract.contract.multiplier = decode_string(&mut fields_itr)?;
+        // contract.order_types = decode_string(&mut fields_itr)?;
+        // contract.valid_exchanges = decode_string(&mut fields_itr)?;
+        // contract.price_magnifier = decode_i32(&mut fields_itr)?;
+        // if version >= 4 {
+        //     contract.under_con_id = decode_i32(&mut fields_itr)?;
+        // }
+        // if version >= 5 {
+        //     contract.long_name = decode_string(&mut fields_itr)?;
+        //     contract.contract.primary_exchange = decode_string(&mut fields_itr)?;
+        // }
+        //
+        // if version >= 6 {
+        //     contract.contract_month = decode_string(&mut fields_itr)?;
+        //     contract.industry = decode_string(&mut fields_itr)?;
+        //     contract.category = decode_string(&mut fields_itr)?;
+        //     contract.subcategory = decode_string(&mut fields_itr)?;
+        //     contract.time_zone_id = decode_string(&mut fields_itr)?;
+        //     contract.trading_hours = decode_string(&mut fields_itr)?;
+        //     contract.liquid_hours = decode_string(&mut fields_itr)?;
+        // }
+        // if version >= 8 {
+        //     contract.ev_rule = decode_string(&mut fields_itr)?;
+        //     contract.ev_multiplier = decode_f64(&mut fields_itr)?;
+        // }
+        //
+        // if version >= 7 {
+        //     let sec_id_list_count = decode_i32(&mut fields_itr)?;
+        //     if sec_id_list_count > 0 {
+        //         contract.sec_id_list = vec![];
+        //         for _ in 0..sec_id_list_count {
+        //             contract.sec_id_list.push(TagValue::new(
+        //                 decode_string(&mut fields_itr)?,
+        //                 decode_string(&mut fields_itr)?,
+        //             ));
+        //         }
+        //     }
+        // }
+        // if self.server_version >= MIN_SERVER_VER_AGG_GROUP {
+        //     contract.agg_group = decode_i32(&mut fields_itr)?;
+        // }
+        //
+        // if self.server_version >= MIN_SERVER_VER_UNDERLYING_INFO {
+        //     contract.under_symbol = decode_string(&mut fields_itr)?;
+        //     contract.under_sec_type = decode_string(&mut fields_itr)?;
+        // }
+        // if self.server_version >= MIN_SERVER_VER_MARKET_RULES {
+        //     contract.market_rule_ids = decode_string(&mut fields_itr)?;
+        // }
+        //
+        // if self.server_version >= MIN_SERVER_VER_REAL_EXPIRATION_DATE {
+        //     contract.real_expiration_date = decode_string(&mut fields_itr)?;
+        // }
+        //
+        // self.wrapper
+        //     .contract_details(req_id, contract.clone());
         Ok(())
     }
 
@@ -825,7 +836,7 @@ impl Decoder
             .display_group_updated(req_id, contract_info.as_ref());
         Ok(())
     }
-    fn process_error_message(&mut self, fields: &[String]) -> Result<(), IBKRApiLibError> {
+    async fn process_error_message(self: Arc<Self>, fields: Vec<String>) -> Result<(), IBKRApiLibError> {
         let mut fields_itr = fields.iter();
 
         //throw away message_id
@@ -837,98 +848,98 @@ impl Decoder
             decode_i32(&mut fields_itr)?,
             decode_i32(&mut fields_itr)?,
             decode_string(&mut fields_itr)?.as_ref(),
-        );
+        ).await;
         Ok(())
     }
 
     //----------------------------------------------------------------------------------------------
-    fn process_execution_data(&mut self, fields: &[String]) -> Result<(), IBKRApiLibError> {
-        let mut fields_itr = fields.iter();
-
-        //throw away message_id
-        fields_itr.next();
-
-        let mut version = self.server_version;
-
-        if self.server_version < MIN_SERVER_VER_LAST_LIQUIDITY {
-            version = decode_i32(&mut fields_itr)?;
-        }
-
-        let mut req_id = -1;
-
-        if version >= 7 {
-            req_id = decode_i32(&mut fields_itr)?;
-        }
-
-        let order_id = decode_i32(&mut fields_itr)?;
-
-        // decode contract fields
-        let mut contract = Contract::default();
-        contract.con_id = decode_i32(&mut fields_itr)?; // ver 5 field
-        contract.symbol = decode_string(&mut fields_itr)?;
-        contract.sec_type = decode_string(&mut fields_itr)?;
-        contract.last_trade_date_or_contract_month = decode_string(&mut fields_itr)?;
-        contract.strike = decode_f64(&mut fields_itr)?;
-        contract.right = decode_string(&mut fields_itr)?;
-        if version >= 9 {
-            contract.multiplier = decode_string(&mut fields_itr)?;
-        }
-        contract.exchange = decode_string(&mut fields_itr)?;
-        contract.currency = decode_string(&mut fields_itr)?;
-        contract.local_symbol = decode_string(&mut fields_itr)?;
-        if version >= 10 {
-            contract.trading_class = decode_string(&mut fields_itr)?;
-        }
-
-        // decode execution fields
-        let mut execution = Execution::default();
-        execution.order_id = order_id;
-        execution.exec_id = decode_string(&mut fields_itr)?;
-        execution.time = decode_string(&mut fields_itr)?;
-        execution.acct_number = decode_string(&mut fields_itr)?;
-        execution.exchange = decode_string(&mut fields_itr)?;
-        execution.side = decode_string(&mut fields_itr)?;
-
-        if self.server_version >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
-            execution.shares = decode_f64(&mut fields_itr)?;
-        } else {
-            execution.shares = decode_i32(&mut fields_itr)? as f64;
-        }
-
-        execution.price = decode_f64(&mut fields_itr)?;
-        execution.perm_id = decode_i32(&mut fields_itr)?; // ver 2 field
-        execution.client_id = decode_i32(&mut fields_itr)?; // ver 3 field
-        execution.liquidation = decode_i32(&mut fields_itr)?; // ver 4 field
-
-        if version >= 6 {
-            execution.cum_qty = decode_f64(&mut fields_itr)?;
-            execution.avg_price = decode_f64(&mut fields_itr)?;
-        }
-
-        if version >= 8 {
-            execution.order_ref = decode_string(&mut fields_itr)?;
-        }
-
-        if version >= 9 {
-            execution.ev_rule = decode_string(&mut fields_itr)?;
-
-            let tmp_ev_mult = (&mut fields_itr).peekable().peek().unwrap().as_str();
-            if tmp_ev_mult != "" {
-                execution.ev_multiplier = decode_f64(&mut fields_itr)?;
-            } else {
-                execution.ev_multiplier = 1.0;
-            }
-        }
-
-        if self.server_version >= MIN_SERVER_VER_MODELS_SUPPORT {
-            execution.model_code = decode_string(&mut fields_itr)?;
-        }
-        if self.server_version >= MIN_SERVER_VER_LAST_LIQUIDITY {
-            execution.last_liquidity = decode_i32(&mut fields_itr)?;
-        }
-
-        self.wrapper
-            .exec_details(req_id, contract, execution);
+    fn process_execution_data(self: Arc<Self>, fields: &[String]) -> Result<(), IBKRApiLibError> {
+        // let mut fields_itr = fields.iter();
+        //
+        // //throw away message_id
+        // fields_itr.next();
+        //
+        // let mut version = self.server_version;
+        //
+        // if self.server_version < MIN_SERVER_VER_LAST_LIQUIDITY {
+        //     version = decode_i32(&mut fields_itr)?;
+        // }
+        //
+        // let mut req_id = -1;
+        //
+        // if version >= 7 {
+        //     req_id = decode_i32(&mut fields_itr)?;
+        // }
+        //
+        // let order_id = decode_i32(&mut fields_itr)?;
+        //
+        // // decode contract fields
+        // let mut contract = Contract::default();
+        // contract.con_id = decode_i32(&mut fields_itr)?; // ver 5 field
+        // contract.symbol = decode_string(&mut fields_itr)?;
+        // contract.sec_type = decode_string(&mut fields_itr)?;
+        // contract.last_trade_date_or_contract_month = decode_string(&mut fields_itr)?;
+        // contract.strike = decode_f64(&mut fields_itr)?;
+        // contract.right = decode_string(&mut fields_itr)?;
+        // if version >= 9 {
+        //     contract.multiplier = decode_string(&mut fields_itr)?;
+        // }
+        // contract.exchange = decode_string(&mut fields_itr)?;
+        // contract.currency = decode_string(&mut fields_itr)?;
+        // contract.local_symbol = decode_string(&mut fields_itr)?;
+        // if version >= 10 {
+        //     contract.trading_class = decode_string(&mut fields_itr)?;
+        // }
+        //
+        // // decode execution fields
+        // let mut execution = Execution::default();
+        // execution.order_id = order_id;
+        // execution.exec_id = decode_string(&mut fields_itr)?;
+        // execution.time = decode_string(&mut fields_itr)?;
+        // execution.acct_number = decode_string(&mut fields_itr)?;
+        // execution.exchange = decode_string(&mut fields_itr)?;
+        // execution.side = decode_string(&mut fields_itr)?;
+        //
+        // if self.server_version >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
+        //     execution.shares = decode_f64(&mut fields_itr)?;
+        // } else {
+        //     execution.shares = decode_i32(&mut fields_itr)? as f64;
+        // }
+        //
+        // execution.price = decode_f64(&mut fields_itr)?;
+        // execution.perm_id = decode_i32(&mut fields_itr)?; // ver 2 field
+        // execution.client_id = decode_i32(&mut fields_itr)?; // ver 3 field
+        // execution.liquidation = decode_i32(&mut fields_itr)?; // ver 4 field
+        //
+        // if version >= 6 {
+        //     execution.cum_qty = decode_f64(&mut fields_itr)?;
+        //     execution.avg_price = decode_f64(&mut fields_itr)?;
+        // }
+        //
+        // if version >= 8 {
+        //     execution.order_ref = decode_string(&mut fields_itr)?;
+        // }
+        //
+        // if version >= 9 {
+        //     execution.ev_rule = decode_string(&mut fields_itr)?;
+        //
+        //     let tmp_ev_mult = (&mut fields_itr).peekable().peek().unwrap().as_str();
+        //     if tmp_ev_mult != "" {
+        //         execution.ev_multiplier = decode_f64(&mut fields_itr)?;
+        //     } else {
+        //         execution.ev_multiplier = 1.0;
+        //     }
+        // }
+        //
+        // if self.server_version >= MIN_SERVER_VER_MODELS_SUPPORT {
+        //     execution.model_code = decode_string(&mut fields_itr)?;
+        // }
+        // if self.server_version >= MIN_SERVER_VER_LAST_LIQUIDITY {
+        //     execution.last_liquidity = decode_i32(&mut fields_itr)?;
+        // }
+        //
+        // self.wrapper
+        //     .exec_details(req_id, contract, execution);
         Ok(())
     }
 
@@ -970,7 +981,7 @@ impl Decoder
     }
 
     //----------------------------------------------------------------------------------------------
-    async fn process_fundamental_data(&mut self, fields: &[String]) -> Result<(), IBKRApiLibError> {
+    async fn process_fundamental_data(self: Arc<Self>, fields: Vec<String>) -> Result<(), IBKRApiLibError> {
         let mut fields_itr = fields.iter();
 
         //throw away message_id
@@ -982,9 +993,7 @@ impl Decoder
         let data = decode_string(&mut fields_itr)?;
 
         let wrapper = Arc::clone(&self.wrapper);
-        spawn( move||{
-            wrapper.fundamental_data(req_id, data.as_ref());
-        } );
+        wrapper.fundamental_data(req_id, data.as_ref()).await;
 
         Ok(())
     }
@@ -1027,12 +1036,13 @@ impl Decoder
     }
 
     //----------------------------------------------------------------------------------------------
-    fn process_historical_data(&mut self, fields: &[String]) -> Result<(), IBKRApiLibError> {
+    async fn process_historical_data(self: Arc<Self>, fields:Vec<String>) -> Result<(), IBKRApiLibError> {
         let mut fields_itr = fields.iter();
         //throw away message_id
         fields_itr.next();
+        let server_version = self.server_version.load(Ordering::SeqCst);
 
-        if self.server_version < MIN_SERVER_VER_SYNT_REALTIME_BARS {
+        if server_version < MIN_SERVER_VER_SYNT_REALTIME_BARS {
             fields_itr.next();
         }
 
@@ -1060,7 +1070,9 @@ impl Decoder
             bar.volume = decode_dec(&mut fields_itr)?;
             bar.wap = decode_dec(&mut fields_itr)?;
 
-            if self.server_version < MIN_SERVER_VER_SYNT_REALTIME_BARS {
+            let server_version = self.server_version.load(Ordering::SeqCst);
+
+            if server_version < MIN_SERVER_VER_SYNT_REALTIME_BARS {
                 decode_string(&mut fields_itr)?; //has_gaps
             }
 
@@ -1072,9 +1084,9 @@ impl Decoder
 
         let wrapper = Arc::clone(&self.wrapper);
 
-        task::spawn(async move {
-            wrapper.historical_data(req_id, bars, start_date.as_ref(), end_date.as_ref() );
-        });
+
+        wrapper.historical_data(req_id, bars, start_date.as_ref(), end_date.as_ref() ).await;
+
 
         // send end of dataset marker
         // self.wrapper.historical_data_end(req_id, start_date.as_ref(), end_date.as_ref());
@@ -1242,7 +1254,7 @@ impl Decoder
     }
 
     //----------------------------------------------------------------------------------------------
-    fn process_managed_accounts(&mut self, fields: &[String]) -> Result<(), IBKRApiLibError> {
+    fn process_managed_accounts(& self, fields: Vec<String>) -> Result<(), IBKRApiLibError> {
         let mut fields_itr = fields.iter();
 
         //throw away message_id
@@ -1312,9 +1324,9 @@ impl Decoder
         let size = decode_i32(&mut fields_itr)?;
         let mut is_smart_depth = false;
 
-        if self.server_version >= MIN_SERVER_VER_SMART_DEPTH {
-            is_smart_depth = decode_bool(&mut fields_itr)?;
-        }
+        // if self.server_version >= MIN_SERVER_VER_SMART_DEPTH {
+        //     is_smart_depth = decode_bool(&mut fields_itr)?;
+        // }
 
         self.wrapper
             .update_mkt_depth_l2(
@@ -1364,19 +1376,19 @@ impl Decoder
         let mut depth_mkt_data_descriptions = vec![];
         let depth_mkt_data_descriptions_count = decode_i32(&mut fields_itr)?;
 
-        for _ in 0..depth_mkt_data_descriptions_count {
-            let mut desc = DepthMktDataDescription::default();
-            desc.exchange = decode_string(&mut fields_itr)?;
-            desc.sec_type = decode_string(&mut fields_itr)?;
-            if self.server_version >= MIN_SERVER_VER_SERVICE_DATA_TYPE {
-                desc.listing_exch = decode_string(&mut fields_itr)?;
-                desc.service_data_type = decode_string(&mut fields_itr)?;
-                desc.agg_group = decode_i32(&mut fields_itr)?;
-            } else {
-                decode_i32(&mut fields_itr)?; // boolean notSuppIsL2
-            }
-            depth_mkt_data_descriptions.push(desc);
-        }
+        // for _ in 0..depth_mkt_data_descriptions_count {
+        //     let mut desc = DepthMktDataDescription::default();
+        //     desc.exchange = decode_string(&mut fields_itr)?;
+        //     desc.sec_type = decode_string(&mut fields_itr)?;
+        //     if self.server_version >= MIN_SERVER_VER_SERVICE_DATA_TYPE {
+        //         desc.listing_exch = decode_string(&mut fields_itr)?;
+        //         desc.service_data_type = decode_string(&mut fields_itr)?;
+        //         desc.agg_group = decode_i32(&mut fields_itr)?;
+        //     } else {
+        //         decode_i32(&mut fields_itr)?; // boolean notSuppIsL2
+        //     }
+        //     depth_mkt_data_descriptions.push(desc);
+        // }
 
         self.wrapper
             .mkt_depth_exchanges(depth_mkt_data_descriptions);
@@ -1444,7 +1456,7 @@ impl Decoder
     }
 
     //----------------------------------------------------------------------------------------------
-    fn process_next_valid_id(&mut self, fields: &[String]) -> Result<(), IBKRApiLibError> {
+    fn process_next_valid_id(& self, fields: Vec<String>) -> Result<(), IBKRApiLibError> {
         let mut fields_itr = fields.iter();
 
         //throw away message_id
@@ -1469,23 +1481,23 @@ impl Decoder
         let mut contract = Contract::default();
         let mut order_state = OrderState::default();
 
-        let mut version = self.server_version;
-        if self.server_version < MIN_SERVER_VER_ORDER_CONTAINER {
-            version = decode_i32(&mut fields_itr)?;
-        }
-
-        let mut order_decoder = OrderDecoder::new(
-            &mut contract,
-            &mut order,
-            &mut order_state,
-            version,
-            self.server_version,
-        );
-
-        order_decoder.decode_open(&mut fields_itr)?;
-
-        self.wrapper
-            .open_order(order.order_id, contract, order, order_state);
+        // let mut version = self.server_version;
+        // if self.server_version < MIN_SERVER_VER_ORDER_CONTAINER {
+        //     version = decode_i32(&mut fields_itr)?;
+        // }
+        //
+        // let mut order_decoder = OrderDecoder::new(
+        //     &mut contract,
+        //     &mut order,
+        //     &mut order_state,
+        //     version,
+        //     self.server_version,
+        // );
+        //
+        // order_decoder.decode_open(&mut fields_itr)?;
+        //
+        // self.wrapper
+        //     .open_order(order.order_id, contract, order, order_state);
         Ok(())
     }
 
@@ -1519,28 +1531,28 @@ impl Decoder
         //throw away message_id
         fields_itr.next();
 
-        if self.server_version < MIN_SERVER_VER_MARKET_CAP_PRICE {
-            fields_itr.next();
-        }
+        // if self.server_version < MIN_SERVER_VER_MARKET_CAP_PRICE {
+        //     fields_itr.next();
+        // }
 
         let order_id = decode_i32(&mut fields_itr)?;
 
         let status = decode_string(&mut fields_itr)?;
 
-        let filled;
-        if self.server_version >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
-            filled = decode_f64(&mut fields_itr)?;
-        } else {
-            filled = decode_i32(&mut fields_itr)? as f64;
-        }
+        // let filled;
+        // if self.server_version >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
+        //     filled = decode_f64(&mut fields_itr)?;
+        // } else {
+        //     filled = decode_i32(&mut fields_itr)? as f64;
+        // }
 
-        let remaining;
+        // let remaining;
 
-        if self.server_version >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
-            remaining = decode_f64(&mut fields_itr)?;
-        } else {
-            remaining = decode_i32(&mut fields_itr)? as f64;
-        }
+        // if self.server_version >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
+        //     remaining = decode_f64(&mut fields_itr)?;
+        // } else {
+        //     remaining = decode_i32(&mut fields_itr)? as f64;
+        // }
 
         let avg_fill_price = decode_f64(&mut fields_itr)?;
 
@@ -1551,23 +1563,23 @@ impl Decoder
         let why_held = decode_string(&mut fields_itr)?; // ver 6 field
 
         let mut mkt_cap_price = 0.0;
-        if self.server_version >= MIN_SERVER_VER_MARKET_CAP_PRICE {
-            mkt_cap_price = decode_f64(&mut fields_itr)?;
-        }
-
-        self.wrapper.order_status(
-                order_id,
-                status.as_ref(),
-                filled,
-                remaining,
-                avg_fill_price,
-                perm_id,
-                parent_id,
-                last_fill_price,
-                client_id,
-                why_held.as_ref(),
-                mkt_cap_price,
-            );
+        // if self.server_version >= MIN_SERVER_VER_MARKET_CAP_PRICE {
+        //     mkt_cap_price = decode_f64(&mut fields_itr)?;
+        // }
+        //
+        // self.wrapper.order_status(
+        //         order_id,
+        //         status.as_ref(),
+        //         filled,
+        //         remaining,
+        //         avg_fill_price,
+        //         perm_id,
+        //         parent_id,
+        //         last_fill_price,
+        //         client_id,
+        //         why_held.as_ref(),
+        //         mkt_cap_price,
+        //     );
         Ok(())
     }
 
@@ -1583,13 +1595,13 @@ impl Decoder
         let mut unrealized_pnl = 0.0;
         let mut realized_pnl = 0.0;
 
-        if self.server_version >= MIN_SERVER_VER_UNREALIZED_PNL {
-            unrealized_pnl = decode_f64(&mut fields_itr)?;
-        }
-
-        if self.server_version >= MIN_SERVER_VER_REALIZED_PNL {
-            realized_pnl = decode_f64(&mut fields_itr)?;
-        }
+        // if self.server_version >= MIN_SERVER_VER_UNREALIZED_PNL {
+        //     unrealized_pnl = decode_f64(&mut fields_itr)?;
+        // }
+        //
+        // if self.server_version >= MIN_SERVER_VER_REALIZED_PNL {
+        //     realized_pnl = decode_f64(&mut fields_itr)?;
+        // }
 
         self.wrapper.pnl(
             req_id,
@@ -1613,13 +1625,13 @@ impl Decoder
         let mut unrealized_pnl = 0.0;
         let mut realized_pnl = 0.0;
 
-        if self.server_version >= MIN_SERVER_VER_UNREALIZED_PNL {
-            unrealized_pnl = decode_f64(&mut fields_itr)?;
-        }
-
-        if self.server_version >= MIN_SERVER_VER_REALIZED_PNL {
-            realized_pnl = decode_f64(&mut fields_itr)?;
-        }
+        // if self.server_version >= MIN_SERVER_VER_UNREALIZED_PNL {
+        //     unrealized_pnl = decode_f64(&mut fields_itr)?;
+        // }
+        //
+        // if self.server_version >= MIN_SERVER_VER_REALIZED_PNL {
+        //     realized_pnl = decode_f64(&mut fields_itr)?;
+        // }
 
         let value = decode_f64(&mut fields_itr)?;
 
@@ -1657,12 +1669,12 @@ impl Decoder
             contract.trading_class = decode_string(&mut fields_itr)?;
         }
 
-        let position;
-        if self.server_version >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
-            position = decode_f64(&mut fields_itr)?;
-        } else {
-            position = decode_i32(&mut fields_itr)? as f64;
-        }
+        // let position;
+        // if self.server_version >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
+        //     position = decode_f64(&mut fields_itr)?;
+        // } else {
+        //     position = decode_i32(&mut fields_itr)? as f64;
+        // }
 
         let market_price = decode_f64(&mut fields_itr)?;
         let market_value = decode_f64(&mut fields_itr)?;
@@ -1672,21 +1684,21 @@ impl Decoder
 
         let account_name = decode_string(&mut fields_itr)?; // ver 4 field
 
-        if version == 6 && self.server_version == 39 {
-            contract.primary_exchange = decode_string(&mut fields_itr)?;
-        }
+        // if version == 6 && self.server_version == 39 {
+        //     contract.primary_exchange = decode_string(&mut fields_itr)?;
+        // }
 
-        self.wrapper
-            .update_portfolio(
-                contract,
-                position,
-                market_price,
-                market_value,
-                average_cost,
-                unrealized_pnl,
-                realized_pnl,
-                account_name.as_ref(),
-            );
+        // self.wrapper
+        //     .update_portfolio(
+        //         contract,
+        //         position,
+        //         market_price,
+        //         market_value,
+        //         average_cost,
+        //         unrealized_pnl,
+        //         realized_pnl,
+        //         account_name.as_ref(),
+        //     );
         Ok(())
     }
 
@@ -1717,24 +1729,24 @@ impl Decoder
             contract.trading_class = decode_string(&mut fields_itr)?;
         }
 
-        let position;
-        if self.server_version >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
-            position = decode_f64(&mut fields_itr)?;
-        } else {
-            position = decode_i32(&mut fields_itr)? as f64;
-        }
+        // let position;
+        // if self.server_version >= MIN_SERVER_VER_FRACTIONAL_POSITIONS {
+        //     position = decode_f64(&mut fields_itr)?;
+        // } else {
+        //     position = decode_i32(&mut fields_itr)? as f64;
+        // }
 
         let mut avg_cost = 0.0;
         if version >= 3 {
             avg_cost = decode_f64(&mut fields_itr)?;
         }
 
-        self.wrapper.position(
-            account.as_ref(),
-            contract,
-            position,
-            avg_cost,
-        );
+        // self.wrapper.position(
+        //     account.as_ref(),
+        //     contract,
+        //     position,
+        //     avg_cost,
+        // );
         Ok(())
     }
 
@@ -2491,31 +2503,32 @@ impl Decoder
     }
 
     //----------------------------------------------------------------------------------------------
-    pub async fn run(&mut self) -> Result<(), IBKRApiLibError> {
+    pub async fn run(self: Arc<Self>, mut msg_queue: Receiver<String>) -> Result<(), IBKRApiLibError> {
         //This is the function that has the message loop.
         const CONN_STATE_POISONED: &str = "Connection state mutex was poisoned";
         info!("Starting run...");
         // !self.done &&
-        while let Some(msg) = self.msg_queue.recv().await {
+        while let Some(msg) = msg_queue.recv().await {
             // debug!("Client waiting for message...");
             debug!(?msg);
                     if msg.len() > MAX_MSG_LEN as usize {
-                        self.wrapper.error(
+                        let wrapper = self.wrapper.clone();
+                        wrapper.error(
                             NO_VALID_ID,
                             TwsError::NotConnected.code(),
                             format!("{}:{}:{}", TwsError::NotConnected.message(), msg.len(), msg)
                                 .as_str(),
-                        );
+                        ).await;
 
                         error!("Error receiving message.  Disconnected: Message too big");
-                        self.wrapper.connection_closed();
+                        wrapper.connection_closed();
 
-                        {
-                            let mut conn_state = self.conn_state.lock().await;
-                            *conn_state = ConnStatus::DISCONNECTED;
-                        }
-
-                        error!("Error receiving message.  Invalid size.  Disconnected.");
+                        // {
+                        //     let mut conn_state = self.conn_state.lock().await;
+                        //     *conn_state = ConnStatus::DISCONNECTED;
+                        // }
+                        //
+                        // error!("Error receiving message.  Invalid size.  Disconnected.");
 
                         return Ok(());
 
@@ -2523,7 +2536,8 @@ impl Decoder
                         let fields = read_fields((&msg).as_ref());
                         debug!(?fields);
 
-                        self.interpret(fields.as_slice()).await?;
+                        // self.clone().interpret(fields.as_slice()).await?;
+                        self.clone().interpret(fields).await?;
                     }
                 }
         Ok(())
@@ -2548,4 +2562,22 @@ impl Decoder
             // }
         // }
     }
+}
+
+
+
+async fn process_error_message(wrapper: impl Wrapper, fields: &[String]) -> Result<(), IBKRApiLibError> {
+    let mut fields_itr = fields.iter();
+
+    //throw away message_id
+    fields_itr.next();
+    //throw away version
+    fields_itr.next();
+
+    wrapper.error(
+        decode_i32(&mut fields_itr)?,
+        decode_i32(&mut fields_itr)?,
+        decode_string(&mut fields_itr)?.as_ref(),
+    ).await;
+    Ok(())
 }
